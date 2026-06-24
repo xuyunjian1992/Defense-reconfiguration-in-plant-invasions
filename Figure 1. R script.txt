@@ -1,0 +1,898 @@
+############################################################
+# Forest plot for row-level meta-analysis
+# Version: revised_v8 for publication-quality Fig. 1 panels
+#
+# Input Excel columns:
+#   StudyID, Variable, Mc, SDc, Nc, Mi, Sdi, Ni
+#
+# Effect size:
+#   yi = ln(Mi/Mc)
+#   vi = (Sdi^2)/(Ni*Mi^2) + (SDc^2)/(Nc*Mc^2)
+#   optional fallback: vi = 1/Nc + 1/Ni
+#
+# Main changes in this version:
+#   1) Primary and trim-and-fill forest PDFs have exactly the same layout,
+#      colors, point color, axis system, and margins.
+#   2) The trim-and-fill PDF is NOT marked in red. It is only an adjusted
+#      sensitivity-result version.
+#   3) Background bands are drawn with numeric y positions, not mixed
+#      factor/continuous coordinates, avoiding row-color misalignment.
+#   4) Overall rows use a soft lavender band; specific traits use a soft
+#      pale-yellow band. Significance stars remain red.
+#   5) Trait labels are blue only when p < 0.05; otherwise black.
+#   6) Sample size is shown as: Trait (n).
+#   7) use_study_random_effect is retained but defaults to FALSE.
+#   8) Outputs two PDFs and two corresponding result tables.
+############################################################
+
+# 0) packages ----
+pkgs <- c("readxl", "dplyr", "purrr", "metafor", "writexl", "tools", "ggplot2", "scales")
+for (p in pkgs) {
+  if (!require(p, character.only = TRUE)) {
+    install.packages(p)
+    library(p, character.only = TRUE)
+  }
+}
+
+# 1) USER CONFIG ----
+# Only change this section for each dataset / figure panel.
+data_dir  <- "D:/ZWFYshujuwenjian xxx"
+file_name <- "xxx.xlsx"
+infile <- file.path(data_dir, file_name)
+
+# Panel title and x-axis label.
+group_title  <- "Chemical Defense"
+x_axis_label <- "Effect Size"
+
+# Overall rows forced to the top if present in Variable.
+overall_names <- c("Physical Defense", "Chemical Defense")
+
+# Model switch.
+# FALSE = original row-level single random-effects model rma(); recommended for your paired rows.
+# TRUE  = try rma.mv(..., random = ~1|StudyID) for the primary forest estimates only.
+#         Note: trim-and-fill itself is still based on the standard rma object.
+use_study_random_effect <- TRUE
+
+# Variance handling.
+use_fallback_1overN <- TRUE
+
+# Publication-bias / trim-and-fill options.
+alpha_egger <- 0.05
+use_begg_ranktest <- TRUE
+alpha_begg <- 0.05
+run_trimfill_if_bias <- TRUE
+
+# This reproduces the old script's behavior: if default trimfill gives k0=0,
+# try side="left" and side="right" and keep the option with larger k0.
+# For a more conservative sensitivity analysis, set FALSE.
+force_try_both_sides_if_k0_0 <- TRUE
+
+# Figure display options.
+show_numeric_effect_text <- FALSE  # reviewer suggested removing estimate/CI text from Fig. 1
+show_significance_stars <- TRUE
+save_png <- TRUE
+
+# IMPORTANT: keep both forest PDFs visually consistent. Do not mark trimfill-adjusted
+# traits in red in the adjusted PDF. The adjusted status is recorded in the output table.
+mark_trimfill_adjusted_points <- FALSE
+
+# Optional fixed x-axis limits for the actual forest data region.
+# Use NULL to calculate automatically from BOTH primary and adjusted CIs.
+# Example: fixed_xlim <- c(-2, 2)
+fixed_xlim <- NULL
+
+# Multi-panel alignment options.
+# To align Fig. 1 panels with different trait counts, use the same target row number,
+# same width, and same height for all subplots. For your current Fig. 1, 9 is useful
+# because the largest panel has 9 displayed rows.
+pad_to_n_rows <- 9
+height_mode <- "fixed"       # "fixed" or "by_rows"
+fixed_plot_height <- 4.15
+row_height <- 0.48
+base_height <- 1.10
+plot_width <- 6.55
+
+# Layout tuning.
+# The x-axis is manually drawn only across the effect-size region.
+# Trait labels are right-aligned immediately to the left of that region, so the
+# zero line stays visually centered and the gap between labels and CIs is reduced.
+label_column_width_ratio <- 0.32
+right_star_width_ratio   <- 0.10
+min_label_column_width   <- 0.80
+min_right_star_width     <- 0.22
+label_to_axis_gap_ratio  <- 0.035
+star_to_axis_gap_ratio   <- 0.080
+label_size <- 4.35
+star_size  <- 5.75
+point_size <- 2.72   # slightly smaller than v7 to reduce crowding around short CIs
+ci_line_width <- 0.82
+ci_cap_height <- 0.155
+
+# Padded blank rows. For clean multi-panel alignment, using the same pale-yellow fill
+# avoids a visually abrupt white block beneath short panels.
+pad_blank_fill <- "specific"   # "specific" or "white"
+
+# Forest colors.
+col_bg_overall  <- "#ECEAF8"  # soft lavender
+col_bg_specific <- "#FFF4D6"  # soft pale yellow
+col_sig_text    <- "#1F5FBF"  # blue for significant labels
+col_nonsig_text <- "black"
+col_star        <- "#D7191C"  # red
+col_point       <- "black"
+col_zero        <- "grey40"
+
+# Output folder.
+out_root <- file.path(
+  data_dir,
+  paste0(tools::file_path_sans_ext(file_name), "_forest_primary_and_trimfill_v8")
+)
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+# 2) helper functions ----
+safe_name <- function(x) {
+  x <- as.character(x)
+  x <- gsub("[/\\\\:*?\"<>|]+", "_", x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("__+", "_", x)
+  x
+}
+
+fmt_p <- function(p) {
+  if (is.na(p) || !is.finite(p)) return("NA")
+  if (p < 1e-4) return(formatC(p, format = "e", digits = 2))
+  formatC(p, format = "f", digits = 4)
+}
+
+stars <- function(p) {
+  if (is.na(p) || !is.finite(p)) return("")
+  if (p < 0.001) return("***")
+  if (p < 0.01)  return("**")
+  if (p < 0.05)  return("*")
+  ""
+}
+
+clean_key <- function(x) {
+  tolower(gsub("[^A-Za-z0-9]+", "", x))
+}
+
+standardize_meta_columns <- function(dat) {
+  aliases <- list(
+    StudyID  = c("studyid", "study", "id", "number", "refid", "referenceid"),
+    Variable = c("variable", "trait", "traits", "index", "category"),
+    Mc       = c("mc", "meanc", "meancontrol", "controlmean", "native_mean", "nativemean", "home_mean", "homemean"),
+    SDc      = c("sdc", "sdcontrol", "controlsd", "native_sd", "nativesd", "home_sd", "homesd"),
+    Nc       = c("nc", "ncontrol", "controln", "native_n", "nativen", "home_n", "homen"),
+    Mi       = c("mi", "meani", "meaninvasive", "invasivemean", "introduced_mean", "introducedmean", "away_mean", "awaymean"),
+    Sdi      = c("sdi", "sdinvasive", "invasivesd", "introduced_sd", "introducedsd", "away_sd", "awaysd"),
+    Ni       = c("ni", "ninvasive", "invasiven", "introduced_n", "introducedn", "away_n", "awayn")
+  )
+  
+  original_names <- names(dat)
+  keys <- clean_key(original_names)
+  
+  for (canonical in names(aliases)) {
+    hit <- which(keys %in% aliases[[canonical]])
+    if (length(hit) == 0) {
+      stop(
+        "Missing required column for ", canonical, ".\n",
+        "Current column names are: ", paste(original_names, collapse = ", ")
+      )
+    }
+    names(dat)[hit[1]] <- canonical
+  }
+  dat
+}
+
+eps <- 1e-12
+compute_row <- function(Mc, SDc, Nc, Mi, Sdi, Ni) {
+  yi <- NA_real_
+  vi <- NA_real_
+  method <- NA_character_
+  
+  if (!is.na(Mc) && !is.na(Mi) && Mc > 0 && Mi > 0) {
+    yi <- log(Mi / Mc)
+    
+    if (!is.na(SDc) && !is.na(Sdi) && is.finite(SDc) && is.finite(Sdi) &&
+        !is.na(Nc) && !is.na(Ni) && Nc > 0 && Ni > 0) {
+      vi <- (Sdi^2) / (Ni * (Mi^2 + eps)) + (SDc^2) / (Nc * (Mc^2 + eps))
+      method <- "SD_formula"
+      if (!is.finite(vi) || vi <= 0) vi <- NA_real_
+    }
+    
+    if (is.na(vi) && isTRUE(use_fallback_1overN) &&
+        !is.na(Nc) && !is.na(Ni) && Nc > 0 && Ni > 0) {
+      vi <- 1 / Nc + 1 / Ni
+      method <- "1/N_fallback"
+      if (!is.finite(vi) || vi <= 0) vi <- NA_real_
+    }
+  } else {
+    method <- "invalid_mean"
+  }
+  
+  list(
+    yi = yi,
+    vi = vi,
+    sei = ifelse(is.na(vi), NA_real_, sqrt(vi)),
+    method = method
+  )
+}
+
+fit_primary_model <- function(dv) {
+  if (isTRUE(use_study_random_effect) &&
+      length(unique(dv$StudyID)) > 1 &&
+      any(duplicated(dv$StudyID))) {
+    
+    fit_mv <- tryCatch(
+      metafor::rma.mv(yi = yi, V = vi, random = ~ 1 | StudyID,
+                      data = dv, method = "REML"),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(fit_mv)) {
+      return(list(fit = fit_mv, model_used = "rma.mv_REML_random_StudyID"))
+    }
+  }
+  
+  fit_uni <- metafor::rma(yi = dv$yi, vi = dv$vi, method = "REML")
+  list(fit = fit_uni, model_used = "rma_REML")
+}
+
+extract_summary <- function(fit_obj) {
+  fit <- fit_obj$fit
+  data.frame(
+    estimate = as.numeric(fit$b[1]),
+    ci.lb = as.numeric(fit$ci.lb[1]),
+    ci.ub = as.numeric(fit$ci.ub[1]),
+    pval = as.numeric(fit$pval[1]),
+    model_used = fit_obj$model_used,
+    stringsAsFactors = FALSE
+  )
+}
+
+# 3) read data & compute row-level yi/vi ----
+raw <- readxl::read_excel(infile)
+raw <- standardize_meta_columns(raw)
+
+df0 <- raw %>%
+  mutate(
+    StudyID  = as.character(StudyID),
+    Variable = trimws(as.character(Variable)),
+    Mc  = as.numeric(Mc),
+    SDc = as.numeric(SDc),
+    Nc  = as.numeric(Nc),
+    Mi  = as.numeric(Mi),
+    Sdi = as.numeric(Sdi),
+    Ni  = as.numeric(Ni),
+    .rowid = dplyr::row_number()
+  )
+
+tmp <- purrr::pmap(
+  df0 %>% dplyr::select(Mc, SDc, Nc, Mi, Sdi, Ni),
+  compute_row
+)
+
+df_all <- df0 %>%
+  mutate(
+    yi = purrr::map_dbl(tmp, "yi"),
+    vi = purrr::map_dbl(tmp, "vi"),
+    sei = purrr::map_dbl(tmp, "sei"),
+    Var_method = purrr::map_chr(tmp, "method")
+  )
+
+df <- df_all %>%
+  filter(
+    !is.na(StudyID), !is.na(Variable),
+    !is.na(yi), !is.na(vi),
+    is.finite(yi), is.finite(vi), vi > 0
+  )
+
+invalid_rows <- df_all %>%
+  filter(
+    is.na(StudyID) | is.na(Variable) |
+      is.na(yi) | is.na(vi) |
+      !is.finite(yi) | !is.finite(vi) | vi <= 0
+  )
+
+if (nrow(df) == 0) stop("No valid effect sizes after filtering. Please check the input data.")
+
+writexl::write_xlsx(
+  list(valid_row_level_effects = df, invalid_or_excluded_rows = invalid_rows),
+  file.path(out_root, "row_level_effectsizes_for_forest.xlsx")
+)
+
+# 4) run meta-analysis by trait + Egger/Begg + trimfill ----
+trait_order_in_file <- unique(df$Variable)
+summary_list <- list()
+
+for (v in trait_order_in_file) {
+  dv <- df %>% filter(Variable == v)
+  n_es <- nrow(dv)
+  k_st <- length(unique(dv$StudyID))
+  if (n_es < 1) next
+  
+  v_dir <- file.path(out_root, paste0("Variable_", safe_name(v)))
+  dir.create(v_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  primary_obj <- tryCatch(fit_primary_model(dv), error = function(e) NULL)
+  if (is.null(primary_obj)) next
+  primary_sm <- extract_summary(primary_obj)
+  
+  res_rma <- tryCatch(metafor::rma(yi = dv$yi, vi = dv$vi, method = "REML"),
+                      error = function(e) NULL)
+  
+  egger_p <- begg_p <- NA_real_
+  eg_obj <- rk_obj <- NULL
+  trigger <- FALSE
+  trf <- NULL
+  trf_used <- FALSE
+  k0_best <- NA_integer_
+  trimfill_side_used <- NA_character_
+  tf_est <- tf_lb <- tf_ub <- tf_p <- NA_real_
+  egger_p_tf <- NA_real_
+  
+  if (!is.null(res_rma)) {
+    eg_obj <- tryCatch(metafor::regtest(res_rma, model = "rma", predictor = "sei"),
+                       error = function(e) NULL)
+    if (!is.null(eg_obj)) egger_p <- tryCatch(as.numeric(eg_obj$pval), error = function(e) NA_real_)
+    
+    rk_obj <- tryCatch(metafor::ranktest(res_rma), error = function(e) NULL)
+    if (!is.null(rk_obj)) begg_p <- tryCatch(as.numeric(rk_obj$pval), error = function(e) NA_real_)
+    
+    if (is.finite(egger_p) && !is.na(egger_p) && egger_p < alpha_egger) trigger <- TRUE
+    if (isTRUE(use_begg_ranktest) && is.finite(begg_p) && !is.na(begg_p) && begg_p < alpha_begg) trigger <- TRUE
+    
+    if (isTRUE(run_trimfill_if_bias) && isTRUE(trigger)) {
+      trf0 <- tryCatch(metafor::trimfill(res_rma), error = function(e) NULL)
+      trimfill_side_used <- "default"
+      
+      if (isTRUE(force_try_both_sides_if_k0_0) && !is.null(trf0)) {
+        k0_0 <- tryCatch(as.integer(trf0$k0), error = function(e) NA_integer_)
+        if (!is.na(k0_0) && k0_0 == 0) {
+          trfL <- tryCatch(metafor::trimfill(res_rma, side = "left"),  error = function(e) NULL)
+          trfR <- tryCatch(metafor::trimfill(res_rma, side = "right"), error = function(e) NULL)
+          k0L <- if (!is.null(trfL)) tryCatch(as.integer(trfL$k0), error = function(e) NA_integer_) else NA_integer_
+          k0R <- if (!is.null(trfR)) tryCatch(as.integer(trfR$k0), error = function(e) NA_integer_) else NA_integer_
+          candidates <- list(default = trf0, left = trfL, right = trfR)
+          k0s <- c(default = k0_0, left = k0L, right = k0R)
+          best_name <- names(which.max(ifelse(is.na(k0s), -Inf, k0s)))[1]
+          trf <- candidates[[best_name]]
+          trimfill_side_used <- best_name
+        } else {
+          trf <- trf0
+        }
+      } else {
+        trf <- trf0
+      }
+      
+      if (!is.null(trf)) {
+        trf_used <- TRUE
+        k0_best <- tryCatch(as.integer(trf$k0), error = function(e) NA_integer_)
+        tf_est <- tryCatch(as.numeric(trf$b[1]), error = function(e) NA_real_)
+        tf_lb  <- tryCatch(as.numeric(trf$ci.lb[1]), error = function(e) NA_real_)
+        tf_ub  <- tryCatch(as.numeric(trf$ci.ub[1]), error = function(e) NA_real_)
+        tf_p   <- tryCatch(as.numeric(trf$pval[1]), error = function(e) NA_real_)
+        
+        res_tf <- tryCatch(metafor::rma(yi = trf$yi, vi = trf$vi, method = "REML"),
+                           error = function(e) NULL)
+        if (!is.null(res_tf)) {
+          eg_tf_obj <- tryCatch(metafor::regtest(res_tf, model = "rma", predictor = "sei"),
+                                error = function(e) NULL)
+          if (!is.null(eg_tf_obj)) egger_p_tf <- tryCatch(as.numeric(eg_tf_obj$pval), error = function(e) NA_real_)
+        }
+      }
+    }
+    
+    sink(file.path(v_dir, "bias_and_trimfill_result.txt"))
+    cat("Variable:", v, "\n")
+    cat("n(effect sizes) =", n_es, "; k(studies) =", k_st, "\n\n")
+    cat("Primary forest model:\n")
+    print(primary_obj$fit)
+    cat("\nStandard rma model used for Egger/Begg/trimfill:\n")
+    print(res_rma)
+    cat("\nEgger regtest:\n")
+    if (is.null(eg_obj)) cat("Egger regtest failed.\n") else print(eg_obj)
+    cat("\nBegg ranktest:\n")
+    if (is.null(rk_obj)) cat("Begg ranktest failed.\n") else print(rk_obj)
+    cat("\nTrimfill triggered:", trigger, "\n")
+    cat("Trimfill side used:", trimfill_side_used, "\n")
+    cat("Trimfill k0:", ifelse(is.na(k0_best), "NA", k0_best), "\n")
+    cat("Egger p after trimfill:", fmt_p(egger_p_tf), "\n\n")
+    if (is.null(trf)) cat("trimfill not used or failed.\n") else print(trf)
+    sink()
+  }
+  
+  use_tf_for_final <- (isTRUE(trigger) && isTRUE(trf_used) && is.finite(tf_est))
+  
+  final_est <- if (use_tf_for_final) tf_est else primary_sm$estimate
+  final_lb  <- if (use_tf_for_final) tf_lb  else primary_sm$ci.lb
+  final_ub  <- if (use_tf_for_final) tf_ub  else primary_sm$ci.ub
+  final_p   <- if (use_tf_for_final) tf_p   else primary_sm$pval
+  
+  summary_list[[v]] <- data.frame(
+    Variable = v,
+    n_es = n_es,
+    k_studies = k_st,
+    primary_model_used = primary_sm$model_used,
+    primary_est = primary_sm$estimate,
+    primary_lb = primary_sm$ci.lb,
+    primary_ub = primary_sm$ci.ub,
+    primary_p = primary_sm$pval,
+    primary_sig = stars(primary_sm$pval),
+    egger_p = egger_p,
+    begg_p = begg_p,
+    trigger_trimfill = trigger,
+    trimfill_used = trf_used,
+    trimfill_side_used = trimfill_side_used,
+    trimfill_k0 = k0_best,
+    egger_p_after_trimfill = egger_p_tf,
+    tf_est = tf_est,
+    tf_lb = tf_lb,
+    tf_ub = tf_ub,
+    tf_p = tf_p,
+    tf_sig = stars(tf_p),
+    use_trimfill_final = use_tf_for_final,
+    final_est = final_est,
+    final_lb = final_lb,
+    final_ub = final_ub,
+    final_p = final_p,
+    final_sig = stars(final_p),
+    final_source = ifelse(use_tf_for_final, "trimfill_adjusted", "primary_original"),
+    stringsAsFactors = FALSE
+  )
+}
+
+summ <- dplyr::bind_rows(summary_list) %>%
+  mutate(
+    egger_sig_primary = ifelse(is.na(egger_p), NA, egger_p < alpha_egger),
+    egger_sig_after_trimfill = ifelse(is.na(egger_p_after_trimfill), NA, egger_p_after_trimfill < alpha_egger)
+  )
+
+if (nrow(summ) == 0) stop("No model could be fitted.")
+
+# Preserve plot order: overall rows first, then order in file.
+present_overall <- overall_names[overall_names %in% summ$Variable]
+other_traits <- trait_order_in_file[trait_order_in_file %in% summ$Variable &
+                                      !(trait_order_in_file %in% present_overall)]
+plot_order <- c(present_overall, other_traits)
+
+summ <- summ %>%
+  mutate(Variable = factor(Variable, levels = plot_order)) %>%
+  arrange(Variable) %>%
+  mutate(Variable = as.character(Variable))
+
+summary_primary <- summ %>%
+  transmute(
+    Variable, n_es, k_studies,
+    estimate = primary_est,
+    ci.lb = primary_lb,
+    ci.ub = primary_ub,
+    pval = primary_p,
+    significance = primary_sig,
+    model_used = primary_model_used,
+    egger_p, begg_p,
+    trigger_trimfill, trimfill_used, trimfill_side_used, trimfill_k0
+  )
+
+summary_trimfill_final <- summ %>%
+  transmute(
+    Variable, n_es, k_studies,
+    estimate = final_est,
+    ci.lb = final_lb,
+    ci.ub = final_ub,
+    pval = final_p,
+    significance = final_sig,
+    final_source,
+    primary_est, primary_lb, primary_ub, primary_p,
+    tf_est, tf_lb, tf_ub, tf_p,
+    egger_p, begg_p,
+    trigger_trimfill, trimfill_used, trimfill_side_used, trimfill_k0,
+    egger_p_after_trimfill
+  )
+
+writexl::write_xlsx(
+  list(
+    summary_all_variables = summ,
+    primary_original_results = summary_primary,
+    trimfill_final_results = summary_trimfill_final,
+    valid_row_level_effects = df,
+    invalid_or_excluded_rows = invalid_rows
+  ),
+  file.path(out_root, "forest_primary_and_trimfill_results.xlsx")
+)
+write.csv(summ, file.path(out_root, "summary_all_variables.csv"), row.names = FALSE)
+write.csv(summary_primary, file.path(out_root, "primary_original_results.csv"), row.names = FALSE)
+write.csv(summary_trimfill_final, file.path(out_root, "trimfill_final_results.csv"), row.names = FALSE)
+
+# Compact, figure-ready tables for quick manuscript/SI checking.
+primary_display_table <- summary_primary %>%
+  mutate(
+    ci_text = sprintf("%.3f (%.3f, %.3f)", estimate, ci.lb, ci.ub),
+    p_text = vapply(pval, fmt_p, character(1))
+  ) %>%
+  select(Variable, n_es, k_studies, estimate, ci.lb, ci.ub, pval, p_text, significance, ci_text,
+         model_used, egger_p, begg_p, trigger_trimfill, trimfill_used, trimfill_side_used, trimfill_k0)
+
+trimfill_display_table <- summary_trimfill_final %>%
+  mutate(
+    ci_text = sprintf("%.3f (%.3f, %.3f)", estimate, ci.lb, ci.ub),
+    p_text = vapply(pval, fmt_p, character(1))
+  ) %>%
+  select(Variable, n_es, k_studies, estimate, ci.lb, ci.ub, pval, p_text, significance, ci_text,
+         final_source, primary_est, primary_lb, primary_ub, primary_p,
+         tf_est, tf_lb, tf_ub, tf_p,
+         egger_p, begg_p, trigger_trimfill, trimfill_used, trimfill_side_used, trimfill_k0,
+         egger_p_after_trimfill)
+
+writexl::write_xlsx(list(primary_original = primary_display_table),
+                    file.path(out_root, "forest_primary_original_statistics.xlsx"))
+writexl::write_xlsx(list(trimfill_adjusted = trimfill_display_table),
+                    file.path(out_root, "forest_trimfill_adjusted_statistics.xlsx"))
+write.csv(primary_display_table, file.path(out_root, "forest_primary_original_statistics.csv"), row.names = FALSE)
+write.csv(trimfill_display_table, file.path(out_root, "forest_trimfill_adjusted_statistics.csv"), row.names = FALSE)
+
+# 5) forest plotting ----
+# v6 layout principle:
+#   The statistical x values are transformed into a fixed-width forest panel
+#   within a 0--1 plotting coordinate system. This prevents an overly wide
+#   x-axis from squeezing/cropping labels or stars, while keeping the tick
+#   labels in the original lnRR/effect-size units.
+make_plot_table <- function(tab, est_col, lb_col, ub_col, p_col) {
+  tab %>%
+    transmute(
+      Variable = Variable,
+      n_es = n_es,
+      estimate = .data[[est_col]],
+      ci.lb = .data[[lb_col]],
+      ci.ub = .data[[ub_col]],
+      pval = .data[[p_col]]
+    )
+}
+
+primary_plot_tab <- make_plot_table(
+  summ,
+  est_col = "primary_est", lb_col = "primary_lb", ub_col = "primary_ub", p_col = "primary_p"
+)
+
+trimfill_plot_tab <- make_plot_table(
+  summ,
+  est_col = "final_est", lb_col = "final_lb", ub_col = "final_ub", p_col = "final_p"
+)
+
+# Same x-axis data limits for the primary and trimfill PDFs.
+all_ci_for_axis <- c(primary_plot_tab$ci.lb, primary_plot_tab$ci.ub,
+                     trimfill_plot_tab$ci.lb, trimfill_plot_tab$ci.ub)
+if (is.null(fixed_xlim)) {
+  raw_range <- range(all_ci_for_axis, na.rm = TRUE)
+  if (!is.finite(raw_range[1]) || !is.finite(raw_range[2]) || raw_range[1] == raw_range[2]) {
+    raw_range <- c(-1, 1)
+  }
+  # Add modest padding but avoid the previous overly-expanded pretty() range.
+  # Always include 0 because it is the null-effect reference line.
+  raw_range <- range(c(raw_range, 0), na.rm = TRUE)
+  raw_width <- diff(raw_range)
+  if (!is.finite(raw_width) || raw_width <= 0) raw_width <- 1
+  x_data_xlim_common <- raw_range + c(-0.08, 0.08) * raw_width
+} else {
+  x_data_xlim_common <- fixed_xlim
+}
+
+format_x_tick <- function(x) {
+  ifelse(abs(x - round(x)) < 1e-8,
+         as.character(round(x)),
+         formatC(x, format = "f", digits = 1))
+}
+
+make_x_breaks <- function(xlim, n = 5) {
+  br <- pretty(xlim, n = n)
+  br <- br[br >= xlim[1] - 1e-9 & br <= xlim[2] + 1e-9]
+  lab <- format_x_tick(br)
+  br[!duplicated(lab)]
+}
+
+assign_y_positions <- function(tab, plot_order, overall_names, pad_to_n_rows) {
+  tab <- tab %>% mutate(Variable = as.character(Variable))
+  
+  real_order <- plot_order[plot_order %in% tab$Variable]
+  total_display_rows <- length(real_order)
+  if (!is.null(pad_to_n_rows) && is.finite(pad_to_n_rows)) {
+    total_display_rows <- max(total_display_rows, pad_to_n_rows)
+  }
+  
+  overall_vars <- real_order[real_order %in% overall_names]
+  specific_vars <- real_order[!(real_order %in% overall_names)]
+  
+  pos_df <- data.frame(Variable = character(), y_num = numeric(), is_overall = logical())
+  
+  if (length(overall_vars) > 0) {
+    pos_df <- rbind(
+      pos_df,
+      data.frame(
+        Variable = overall_vars,
+        y_num = seq(total_display_rows, total_display_rows - length(overall_vars) + 1),
+        is_overall = TRUE,
+        stringsAsFactors = FALSE
+      )
+    )
+    specific_block_top <- total_display_rows - length(overall_vars)
+  } else {
+    specific_block_top <- total_display_rows
+  }
+  
+  # Center specific rows inside the yellow block when there are padded rows.
+  if (length(specific_vars) > 0) {
+    available <- specific_block_top
+    n_spec <- length(specific_vars)
+    if (available <= n_spec) {
+      y_spec <- seq(available, 1, length.out = n_spec)
+    } else {
+      gap <- (available - n_spec) / 2
+      y_spec <- seq(available - gap, 1 + gap, length.out = n_spec)
+    }
+    pos_df <- rbind(
+      pos_df,
+      data.frame(
+        Variable = specific_vars,
+        y_num = y_spec,
+        is_overall = FALSE,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+  
+  list(pos = pos_df, total_display_rows = total_display_rows,
+       n_overall = length(overall_vars), specific_block_top = specific_block_top)
+}
+
+plot_forest_refstyle <- function(plot_tab, title, outfile_pdf, outfile_png = NULL,
+                                 plot_order, overall_names, x_data_xlim_common) {
+  
+  pos_info <- assign_y_positions(plot_tab, plot_order, overall_names, pad_to_n_rows)
+  pos_df <- pos_info$pos
+  total_display_rows <- pos_info$total_display_rows
+  n_overall <- pos_info$n_overall
+  specific_block_top <- pos_info$specific_block_top
+  
+  
+  # Fixed layout coordinates in a 0--1 plotting space.
+  # v6 separates the label, forest, and star areas to avoid overflow.
+  # Overall labels are left-aligned inside the lavender band; specific trait labels
+  # are slightly indented inside the pale-yellow band.
+  x_bg_min <- 0.010
+  x_bg_max <- 0.990
+  # Keep all trait labels left-aligned at the same x position. This avoids
+  # the visually uneven indentation seen when long labels such as "Leaf Thickness"
+  # are mixed with shorter labels.
+  x_label_overall <- 0.030
+  x_label_specific <- 0.030
+  # Slightly shift the forest region left so that the forest axis title and the
+  # panel title are visually more balanced within the whole figure panel.
+  x_forest_min <- 0.390
+  x_forest_max <- 0.735
+  x_title_center <- mean(c(x_forest_min, x_forest_max))
+  x_star <- 0.890
+  xlim_use <- c(0, 1)
+  
+  plot_tab <- plot_tab %>%
+    mutate(Variable_chr = as.character(Variable)) %>%
+    left_join(pos_df, by = c("Variable_chr" = "Variable")) %>%
+    filter(!is.na(y_num)) %>%
+    mutate(
+      label_text = paste0(Variable_chr, " (", n_es, ")"),
+      star_label = if (isTRUE(show_significance_stars)) vapply(pval, stars, character(1)) else rep("", dplyr::n()),
+      label_color = ifelse(!is.na(pval) & pval < 0.05, col_sig_text, col_nonsig_text),
+      label_x = ifelse(is_overall, x_label_overall, x_label_specific)
+    )
+  
+  # Data-value to fixed-panel-coordinate transform.
+  x_min <- x_data_xlim_common[1]
+  x_max <- x_data_xlim_common[2]
+  if (!is.finite(x_min) || !is.finite(x_max) || x_min == x_max) {
+    x_min <- -1; x_max <- 1
+  }
+  transform_x <- function(x) {
+    x_forest_min + (x - x_min) / (x_max - x_min) * (x_forest_max - x_forest_min)
+  }
+  
+  # Clip only CI endpoints to plotting axis limits, so extremely long intervals do not
+  # push labels/stars out of the panel. Values are still kept unchanged in the result tables.
+  plot_tab <- plot_tab %>%
+    mutate(
+      ci.lb_clip = pmax(ci.lb, x_min),
+      ci.ub_clip = pmin(ci.ub, x_max),
+      x_est = transform_x(estimate),
+      x_lb = transform_x(ci.lb_clip),
+      x_ub = transform_x(ci.ub_clip)
+    )
+  
+  bg_df <- data.frame(
+    xmin = x_bg_min, xmax = x_bg_max,
+    ymin = c(if (n_overall > 0) specific_block_top + 0.5 else NA_real_, 0.5),
+    ymax = c(if (n_overall > 0) total_display_rows + 0.5 else NA_real_, specific_block_top + 0.5),
+    fill = c(if (n_overall > 0) col_bg_overall else NA_character_, col_bg_specific),
+    stringsAsFactors = FALSE
+  ) %>% filter(!is.na(ymin), !is.na(ymax), !is.na(fill))
+  
+  cap_df <- plot_tab %>%
+    transmute(
+      x_left = x_lb, x_right = x_ub,
+      y = y_num,
+      y_low = y_num - ci_cap_height,
+      y_high = y_num + ci_cap_height
+    )
+  
+  x_breaks <- make_x_breaks(x_data_xlim_common, n = 5)
+  axis_df <- data.frame(
+    x_value = x_breaks,
+    x = transform_x(x_breaks),
+    label = format_x_tick(x_breaks)
+  )
+  x_zero <- transform_x(0)
+  
+  # Manual x-axis is drawn exactly along the lower boundary of the yellow band,
+  # so there is no white gap between the plot region and the axis line.
+  y_axis <- 0.5
+  y_tick_bottom <- 0.36
+  y_tick_text <- 0.16
+  # Move the x-axis title downward and the panel title upward so neither touches the color bands.
+  y_axis_title <- -0.42
+  y_panel_title <- total_display_rows + 1.16
+  
+  p <- ggplot() +
+    annotate(
+      "text",
+      x = x_title_center, y = y_panel_title,
+      label = title,
+      size = 6.35, fontface = "bold", color = "black"
+    ) +
+    geom_rect(
+      data = bg_df,
+      aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+      color = NA, inherit.aes = FALSE
+    ) +
+    scale_fill_identity() +
+    # Restore the dashed zero-effect line. Use annotate() for fixed coordinates;
+    # geom_segment(x=..., y=...) without aes/data can be ignored by ggplot2.
+    annotate(
+      "segment",
+      x = x_zero, xend = x_zero,
+      y = 0.5, yend = total_display_rows + 0.5,
+      linetype = "dashed", linewidth = 0.72, color = col_zero
+    ) +
+    geom_segment(
+      data = plot_tab,
+      aes(x = x_lb, xend = x_ub, y = y_num, yend = y_num),
+      linewidth = ci_line_width, color = "black", inherit.aes = FALSE
+    ) +
+    geom_segment(
+      data = cap_df,
+      aes(x = x_left, xend = x_left, y = y_low, yend = y_high),
+      linewidth = ci_line_width, color = "black", inherit.aes = FALSE
+    ) +
+    geom_segment(
+      data = cap_df,
+      aes(x = x_right, xend = x_right, y = y_low, yend = y_high),
+      linewidth = ci_line_width, color = "black", inherit.aes = FALSE
+    ) +
+    geom_point(
+      data = plot_tab,
+      aes(x = x_est, y = y_num),
+      size = point_size, color = col_point, inherit.aes = FALSE
+    ) +
+    geom_text(
+      data = plot_tab,
+      aes(x = label_x, y = y_num, label = label_text, color = label_color),
+      inherit.aes = FALSE,
+      hjust = 0, vjust = 0.5, size = label_size, fontface = "bold"
+    ) +
+    scale_color_identity() +
+    geom_text(
+      data = plot_tab,
+      aes(x = x_star, y = y_num, label = star_label),
+      inherit.aes = FALSE,
+      hjust = 0.5, vjust = 0.5, size = star_size, color = col_star, fontface = "bold"
+    ) +
+    # Manual axis only spans the fixed forest region, not the label/star columns.
+    annotate(
+      "segment",
+      x = x_forest_min, xend = x_forest_max,
+      y = y_axis, yend = y_axis,
+      linewidth = 0.58, color = "black"
+    ) +
+    geom_segment(data = axis_df,
+                 aes(x = x, xend = x, y = y_axis, yend = y_tick_bottom),
+                 linewidth = 0.40, color = "black", inherit.aes = FALSE) +
+    geom_text(data = axis_df,
+              aes(x = x, y = y_tick_text, label = label),
+              size = 4.12, color = "black", inherit.aes = FALSE) +
+    annotate(
+      "text",
+      x = x_title_center, y = y_axis_title,
+      label = x_axis_label,
+      size = 4.70, fontface = "bold", color = "black"
+    ) +
+    coord_cartesian(xlim = xlim_use,
+                    ylim = c(-0.82, y_panel_title + 0.14),
+                    clip = "off") +
+    labs(x = NULL, y = NULL) +
+    theme_void(base_size = 13, base_family = "sans") +
+    theme(
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(1, 3, 4, 3)
+    )
+  
+  if (isTRUE(show_numeric_effect_text)) {
+    plot_tab$effect_text <- sprintf("%.3f (%.3f, %.3f)",
+                                    plot_tab$estimate, plot_tab$ci.lb, plot_tab$ci.ub)
+    p <- p +
+      geom_text(
+        data = plot_tab,
+        aes(x = 0.915, y = y_num, label = effect_text),
+        inherit.aes = FALSE,
+        hjust = 0, vjust = 0.5, size = 3.0, color = "black"
+      )
+  }
+  
+  n_rows_for_height <- if (!is.null(pad_to_n_rows) && is.finite(pad_to_n_rows)) {
+    max(total_display_rows, pad_to_n_rows)
+  } else {
+    total_display_rows
+  }
+  
+  height_pdf <- if (identical(height_mode, "fixed")) {
+    fixed_plot_height
+  } else {
+    max(3.4, base_height + row_height * n_rows_for_height)
+  }
+  
+  ggsave(outfile_pdf, p, width = plot_width, height = height_pdf, dpi = 300, device = cairo_pdf)
+  if (isTRUE(save_png) && !is.null(outfile_png)) {
+    ggsave(outfile_png, p, width = plot_width, height = height_pdf, dpi = 600)
+  }
+}
+
+# 6) produce the two forest PDFs ----
+plot_forest_refstyle(
+  primary_plot_tab,
+  title = group_title,
+  outfile_pdf = file.path(out_root, "forest_primary_original.pdf"),
+  outfile_png = file.path(out_root, "forest_primary_original.png"),
+  plot_order = plot_order,
+  overall_names = overall_names,
+  x_data_xlim_common = x_data_xlim_common
+)
+
+plot_forest_refstyle(
+  trimfill_plot_tab,
+  title = group_title,
+  outfile_pdf = file.path(out_root, "forest_trimfill_adjusted.pdf"),
+  outfile_png = file.path(out_root, "forest_trimfill_adjusted.png"),
+  plot_order = plot_order,
+  overall_names = overall_names,
+  x_data_xlim_common = x_data_xlim_common
+)
+
+cat("\nDONE. Outputs saved in:\n", out_root, "\n")
+cat("Key outputs:\n")
+cat(" - forest_primary_original.pdf\n")
+cat(" - forest_trimfill_adjusted.pdf\n")
+cat(" - forest_primary_and_trimfill_results.xlsx\n")
+cat(" - forest_primary_original_statistics.xlsx\n")
+cat(" - forest_trimfill_adjusted_statistics.xlsx\n")
+cat(" - row_level_effectsizes_for_forest.xlsx\n")
+cat("\nNotes:\n")
+cat(" - Primary and trim-and-fill PDFs use the same style, axis limits, colors, and margins.\n")
+cat(" - Trim-and-fill adjusted traits are NOT highlighted in red in the figure; see result tables instead.\n")
+cat(" - Specific trait rows are centered within the yellow block when pad_to_n_rows is larger than the number of real rows.\n")
+cat(" - CI bars include short vertical caps at both ends.\n")
+cat(" - The dashed zero-effect line is restored and drawn from the lower yellow-band boundary to the upper lavender-band boundary.\n")
+cat(" - Label color: p < 0.05 is blue; non-significant is black. Red stars indicate significance.\n")
+cat(" - Sample size is shown as Trait (n).\n")
+cat(" - The statistical x-axis is transformed into a fixed-width forest panel; all trait labels are left-aligned and stars are kept in a separate right column.\n")
+cat(" - use_study_random_effect is currently ", use_study_random_effect, ".\n", sep = "")
+cat(" - If assembling several panels, keep pad_to_n_rows, height_mode, fixed_plot_height, and plot_width identical across scripts.\n")
+############################################################
+# END
+############################################################
+
+# v8 note: title moved slightly upward, x-axis title downward, and point size reduced for cleaner forest panels.
