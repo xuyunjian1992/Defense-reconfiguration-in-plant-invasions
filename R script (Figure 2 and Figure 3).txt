@@ -1,0 +1,2828 @@
+############################################################
+## Figure 2 + Figure 3 integrated raw-lnRR analysis
+##
+## Comparison: invasive plants vs native plants
+## Direction: lnRR = log(Mi/Mc) = log(invasive/native)
+## Input path and file name follow the original F3/F5 program.
+##
+## Figure 2 module
+##   Four broad nutrient-defense relationships.
+##   Original WLS quadratic model, RAW main analysis and IQR sensitivity.
+##
+## Figure 3 module
+##   Structural-material total and trait-specific relationships.
+##   Original linear/quadratic WLS fitting, selection, paired lnRR forest plots
+##   and funnel plots.
+##
+## Integration rule
+##   The two original modules run in separate local environments. Their lnRR
+##   formulas, filtering, pairing, weighting, model and plotting functions are
+##   retained. Only the shared path, comparison/metric scope, output folders
+##   and integration checks are changed.
+############################################################
+
+# =========================
+# 0) Shared packages
+# =========================
+combined_pkgs <- c(
+  "readxl", "dplyr", "tidyr", "stringr", "ggplot2", "writexl",
+  "tibble", "scales", "purrr", "metafor", "patchwork",
+  "clubSandwich", "robustbase"
+)
+repos_now <- getOption("repos")
+if (is.null(repos_now) || is.na(repos_now["CRAN"]) ||
+    identical(unname(repos_now["CRAN"]), "@CRAN@")) {
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
+}
+missing_pkgs <- combined_pkgs[
+  !vapply(combined_pkgs, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_pkgs)) {
+  install.packages(missing_pkgs, dependencies = TRUE)
+}
+still_missing <- combined_pkgs[
+  !vapply(combined_pkgs, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(still_missing)) {
+  stop(
+    "Required packages are still missing: ",
+    paste(still_missing, collapse = ", "),
+    ". Install them once and rerun the script."
+  )
+}
+invisible(lapply(
+  combined_pkgs,
+  function(pkg) suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+))
+
+# =========================
+# 1) Shared path and output
+# =========================
+shared_data_dir <- "D:/ZWFYshujuwenjian/AAAAA-Ecology Letters/JTnhRYandRB"
+shared_file_name <- "NHshujuBG.xlsx"
+shared_sheet_name <- 1
+
+shared_input_file <- file.path(shared_data_dir, shared_file_name)
+if (!file.exists(shared_input_file)) {
+  fallback_input <- file.path(getwd(), shared_file_name)
+  if (file.exists(fallback_input)) {
+    shared_data_dir <- getwd()
+    shared_input_file <- fallback_input
+  } else {
+    stop(
+      "Cannot find NHshujuBG.xlsx. Checked: ", shared_input_file,
+      " and ", fallback_input,
+      ". Keep the F3/F5 path or place the Excel file in the working directory."
+    )
+  }
+}
+
+combined_out_dir <- file.path(
+  shared_data_dir,
+  "Figure2_Figure3_lnRR_INTEGRATED_FINAL"
+)
+dir.create(combined_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+message("============================================================")
+message("Starting integrated Figure 2 + Figure 3 raw-lnRR analysis")
+message("Input: ", shared_input_file)
+message("============================================================")
+
+# =========================
+# 2) Figure 2 module
+# =========================
+message("Running Figure 2 broad raw-lnRR module...")
+local({
+# =========================
+# 1) USER CONFIG
+# =========================
+data_dir   <- shared_data_dir
+file_name  <- shared_file_name
+sheet_name <- shared_sheet_name
+
+out_dir <- file.path(combined_out_dir, "Figure2_broad_lnRR")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+## Run one or both comparison types
+comparison_to_run <- c("invasive_vs_native")
+
+## Which effect metrics to run:
+## DIFF = signed-normalized raw differences, similar to your previous fitting logic.
+## LNRR = log response ratio, WLS only, no signed normalization by default.
+metric_to_run <- c("LNRR")
+
+## Conservative filters for main regression.
+use_for_regression_keep <- c("main")
+pairing_level_keep      <- c("exact", "baseline")
+data_level_keep         <- c("species_pair", "treatment_level", "population_pair")
+tissue_keep             <- c("leaf")   # set character(0) to use all tissues
+
+## Safety check: treat lignin as physical/structural defense even if entered as chemical_defense.
+force_lignin_to_physical <- TRUE
+
+## DIFF standardization:
+## global_signed_norm = closest to your previous difference-fitting program.
+## within_trait_signed_norm = stricter, more conservative.
+diff_standardization_mode <- "global_signed_norm"
+
+## LNRR standardization:
+## FALSE = use raw lnRR values, recommended because lnRR is dimensionless.
+## TRUE  = signed-normalize lnRR values as a sensitivity option.
+standardize_lnrr <- FALSE
+lnrr_standardization_mode <- "global_signed_norm"
+
+## Outlier sensitivity. RAW remains the main result.
+run_iqr_sensitivity <- TRUE
+iqr_k <- 1.5
+
+## Optional weight capping for sensitivity.
+## FALSE is most transparent. If extreme weights dominate WLS, set TRUE and report as sensitivity only.
+cap_wls_weights <- FALSE
+weight_cap_quantile <- 0.99
+
+## Plot settings
+pdf_w <- 6.8
+pdf_h <- 5.6
+base_font_size <- 18
+point_size_range <- c(2.2, 8.0)
+eps <- 1e-12
+
+## Plot safety controls.
+## These do not change model fitting or reported statistics; they only prevent visually unstable
+## confidence ribbons/curves from spilling outside the plotting panel.
+clip_panel <- TRUE
+trim_unstable_ci_edges <- TRUE
+ci_width_cap_multiplier <- 4.0
+min_ci_points_to_draw <- 12
+
+## DIFF model methods.
+diff_model_methods <- c("WLS")
+## LNRR model methods: only WLS as requested.
+lnrr_model_methods <- c("WLS")
+model_forms <- c("quadratic")
+
+## rma.mv random structure for DIFF sensitivity.
+rma_mv_random_structure <- "StudyID"  # or "StudyID_SystemID"
+
+analysis_plan <- tibble::tribble(
+  ~analysis_id,          ~x_trait, ~y_category,
+  "C_physical_total",   "C",      "physical_defense",
+  "C_chemical_total",   "C",      "chemical_defense",
+  "N_chemical_total",   "N",      "chemical_defense",
+  "P_chemical_total",   "P",      "chemical_defense"
+)
+
+## Only run the exact V4-style selected outputs requested:
+## 1) invasive_vs_native: LNRR + WLS quadratic, RAW and IQR_removed
+## 2) introduced_vs_native_range: DIFF + WLS quadratic, RAW and IQR_removed
+should_run_selected_task <- function(metric, comparison_type) {
+  metric == "LNRR" && comparison_type == "invasive_vs_native"
+}
+
+# =========================
+# 2) Helper functions
+# =========================
+clean_key <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+  x <- stringr::str_replace_all(x, "\\s+", "_")
+  x <- stringr::str_replace_all(x, "[^A-Za-z0-9_\\-\\.]+", "-")
+  x <- stringr::str_replace_all(x, "-+", "-")
+  x
+}
+
+std_text <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+  x <- stringr::str_replace_all(x, "\\s+", "_")
+  tolower(x)
+}
+
+std_trait <- function(x) {
+  x0 <- stringr::str_trim(as.character(x))
+  x1 <- tolower(x0)
+  x1 <- stringr::str_replace_all(x1, "[_\\-]+", " ")
+  x1 <- stringr::str_squish(x1)
+  dplyr::case_when(
+    x1 %in% c("c", "carbon", "leaf c", "plant c", "total c") ~ "C",
+    x1 %in% c("n", "nitrogen", "leaf n", "plant n", "total n") ~ "N",
+    x1 %in% c("p", "phosphorus", "phosphorous", "leaf p", "plant p", "total p") ~ "P",
+    x1 %in% c("phenolics", "phenolic", "total phenolics", "total phenols", "phenols", "polyphenols") ~ "Phenolics",
+    x1 %in% c("tannins", "tannin", "condensed tannins", "total tannins") ~ "Tannins",
+    x1 %in% c("flavonoids", "flavonoid", "total flavonoids") ~ "Flavonoids",
+    x1 %in% c("terpenoids", "terpene", "terpenes", "total terpenes", "total terpenoids") ~ "Terpenoids",
+    x1 %in% c("alkaloids", "alkaloid", "total alkaloids") ~ "Alkaloids",
+    x1 %in% c("glucosinolates", "glucosinolate") ~ "Glucosinolates",
+    x1 %in% c("glycosides", "glycoside") ~ "Glycosides",
+    x1 %in% c("saponins", "saponin") ~ "Saponins",
+    x1 %in% c("proteinaceous toxins", "protein toxins", "protease inhibitors", "proteinase inhibitors") ~ "Proteinaceous toxins",
+    x1 %in% c("cellulose") ~ "Cellulose",
+    x1 %in% c("hemicellulose", "hemi cellulose") ~ "Hemicellulose",
+    x1 %in% c("lignin") ~ "Lignin",
+    x1 %in% c("wax", "waxes", "leaf wax") ~ "Wax",
+    x1 %in% c("resin", "resins") ~ "Resin",
+    x1 %in% c("latex") ~ "Latex",
+    x1 %in% c("leaf toughness", "toughness") ~ "Leaf toughness",
+    x1 %in% c("leaf thickness", "thickness") ~ "Leaf thickness",
+    x1 %in% c("lma", "leaf mass per area", "leaf mass area") ~ "LMA",
+    x1 %in% c("sla", "specific leaf area") ~ "SLA",
+    x1 %in% c("trichome", "trichomes", "trichome density", "trichome number") ~ "Trichome density",
+    TRUE ~ x0
+  )
+}
+
+fmt_num <- function(x, d = 3) {
+  if (length(x) == 0 || is.na(x) || !is.finite(x)) return("NA")
+  formatC(as.numeric(x), digits = d, format = "f")
+}
+
+safe_AIC <- function(obj) {
+  out <- tryCatch(stats::AIC(obj), error = function(e) NA_real_)
+  if (length(out) == 0 || !is.finite(out[1])) return(NA_real_)
+  as.numeric(out[1])
+}
+
+var_delta <- function(SDc, Nc, SDi, Ni) {
+  (SDi^2) / (Ni + eps) + (SDc^2) / (Nc + eps)
+}
+
+var_lnrr <- function(Mc, SDc, Nc, Mi, SDi, Ni) {
+  (SDi^2) / ((Ni + eps) * (Mi^2 + eps)) +
+    (SDc^2) / ((Nc + eps) * (Mc^2 + eps))
+}
+
+weighted_R2 <- function(y, yhat, w, clamp_zero = TRUE) {
+  ok <- is.finite(y) & is.finite(yhat) & is.finite(w) & w > 0
+  y <- y[ok]; yhat <- yhat[ok]; w <- w[ok]
+  if (length(y) < 3) return(NA_real_)
+  ybar <- sum(w * y) / sum(w)
+  sst <- sum(w * (y - ybar)^2)
+  sse <- sum(w * (y - yhat)^2)
+  if (!is.finite(sst) || sst <= 0) return(NA_real_)
+  r2 <- 1 - sse / sst
+  if (!is.finite(r2)) return(NA_real_)
+  if (isTRUE(clamp_zero)) r2 <- max(0, r2)
+  r2
+}
+
+weighted_R2_from_coefs <- function(df, b0, b1, b2 = 0) {
+  yhat <- b0 + b1 * df$zX + b2 * df$zX^2
+  weighted_R2(df$zY, yhat, df$w_for_model, clamp_zero = TRUE)
+}
+
+signed_norm_vec <- function(x, var = NULL, eps2 = 1e-8) {
+  x <- as.numeric(x)
+  if (is.null(var)) var <- rep(NA_real_, length(x))
+  var <- as.numeric(var)
+  z <- rep(NA_real_, length(x))
+  dz <- rep(NA_real_, length(x))
+
+  global_sd <- stats::sd(x[is.finite(x)], na.rm = TRUE)
+  global_mu <- mean(x[is.finite(x)], na.rm = TRUE)
+  if (!is.finite(global_sd) || global_sd <= eps2) global_sd <- 1
+  if (!is.finite(global_mu)) global_mu <- 0
+
+  pos <- x[is.finite(x) & x > 0]
+  neg <- x[is.finite(x) & x < 0]
+  mu_pos <- if (length(pos) >= 2) mean(pos) else global_mu
+  sd_pos <- if (length(pos) >= 2) stats::sd(pos) else global_sd
+  mu_neg <- if (length(neg) >= 2) mean(neg) else global_mu
+  sd_neg <- if (length(neg) >= 2) stats::sd(neg) else global_sd
+  if (!is.finite(sd_pos) || sd_pos <= eps2) sd_pos <- global_sd
+  if (!is.finite(sd_neg) || sd_neg <= eps2) sd_neg <- global_sd
+
+  for (i in seq_along(x)) {
+    if (!is.finite(x[i])) next
+    if (x[i] > 0) {
+      z[i] <- (x[i] - mu_pos) / sd_pos
+      dz[i] <- 1 / sd_pos
+    } else if (x[i] < 0) {
+      z[i] <- (x[i] - mu_neg) / sd_neg
+      dz[i] <- 1 / sd_neg
+    } else {
+      z[i] <- 0
+      dz[i] <- 1 / global_sd
+    }
+  }
+  list(z = z, dz = dz, var_z = (dz^2) * var)
+}
+
+standardize_diff <- function(df) {
+  tx <- signed_norm_vec(df$X_value_raw, df$Var_X_raw)
+  df$zX <- tx$z
+  df$Var_zX <- tx$var_z
+
+  ty_global <- signed_norm_vec(df$Y_value_raw, df$Var_Y_raw)
+  df$zY <- ty_global$z
+  df$vi <- ty_global$var_z
+  df$Y_standardization <- "global_signed_norm"
+
+  if (diff_standardization_mode == "within_trait_signed_norm") {
+    spl <- split(seq_len(nrow(df)), df$YTrait)
+    for (ii in spl) {
+      if (length(ii) >= 3) {
+        ty <- signed_norm_vec(df$Y_value_raw[ii], df$Var_Y_raw[ii])
+        df$zY[ii] <- ty$z
+        df$vi[ii] <- ty$var_z
+        df$Y_standardization[ii] <- "within_trait_signed_norm"
+      }
+    }
+  }
+  df
+}
+
+standardize_lnrr_if_needed <- function(df) {
+  if (!isTRUE(standardize_lnrr)) {
+    df$zX <- df$X_value_raw
+    df$zY <- df$Y_value_raw
+    df$vi <- df$Var_Y_raw
+    df$Var_zX <- df$Var_X_raw
+    df$Y_standardization <- "raw_lnRR_no_standardization"
+    return(df)
+  }
+
+  tx <- signed_norm_vec(df$X_value_raw, df$Var_X_raw)
+  df$zX <- tx$z
+  df$Var_zX <- tx$var_z
+
+  ty_global <- signed_norm_vec(df$Y_value_raw, df$Var_Y_raw)
+  df$zY <- ty_global$z
+  df$vi <- ty_global$var_z
+  df$Y_standardization <- "lnRR_global_signed_norm"
+
+  if (lnrr_standardization_mode == "within_trait_signed_norm") {
+    spl <- split(seq_len(nrow(df)), df$YTrait)
+    for (ii in spl) {
+      if (length(ii) >= 3) {
+        ty <- signed_norm_vec(df$Y_value_raw[ii], df$Var_Y_raw[ii])
+        df$zY[ii] <- ty$z
+        df$vi[ii] <- ty$var_z
+        df$Y_standardization[ii] <- "lnRR_within_trait_signed_norm"
+      }
+    }
+  }
+  df
+}
+
+make_xgrid <- function(x, n = 240) {
+  xr <- range(x, na.rm = TRUE)
+  if (!all(is.finite(xr)) || diff(xr) == 0) return(seq(-1, 1, length.out = n))
+  seq(xr[1], xr[2], length.out = n)
+}
+
+iqr_filter_2d <- function(df, xcol = "zX", ycol = "zY", k = 1.5) {
+  if (nrow(df) < 4) return(df)
+  qx <- stats::quantile(df[[xcol]], probs = c(0.25, 0.75), na.rm = TRUE)
+  qy <- stats::quantile(df[[ycol]], probs = c(0.25, 0.75), na.rm = TRUE)
+  iqx <- qx[2] - qx[1]; iqy <- qy[2] - qy[1]
+  lx <- qx[1] - k * iqx; ux <- qx[2] + k * iqx
+  ly <- qy[1] - k * iqy; uy <- qy[2] + k * iqy
+  df %>% dplyr::filter(.data[[xcol]] >= lx, .data[[xcol]] <= ux,
+                        .data[[ycol]] >= ly, .data[[ycol]] <= uy)
+}
+
+get_axis_labels <- function(comparison_type, x_trait, y_category, metric = "DIFF") {
+  y_def <- ifelse(y_category == "physical_defense", "Physical defense", "Chemical defense")
+  if (metric == "LNRR") {
+    return(list(x = paste0("LnRR-", x_trait), y = paste0("LnRR-", y_def)))
+  }
+  if (comparison_type == "introduced_vs_native_range") {
+    list(x = paste0("Cha-", x_trait), y = paste0("Cha-", y_def))
+  } else {
+    list(x = paste0("Diff-", x_trait), y = paste0("Diff-", y_def))
+  }
+}
+
+plot_file_label <- function(comparison_type, analysis_id, metric = "DIFF") {
+  prefix <- if (metric == "LNRR") {
+    ifelse(comparison_type == "introduced_vs_native_range", "LNRR_I.range-N.range", "LNRR_INV-NAT")
+  } else {
+    ifelse(comparison_type == "introduced_vs_native_range", "Cha_I.range-N.range", "Diff_INV-NAT")
+  }
+  suffix <- dplyr::case_when(
+    analysis_id == "C_physical_total" ~ "for_C_vs_Physical_defense",
+    analysis_id == "C_chemical_total" ~ "for_C_vs_Chemical_defense",
+    analysis_id == "N_chemical_total" ~ "for_N_vs_Chemical_defense",
+    analysis_id == "P_chemical_total" ~ "for_P_vs_Chemical_defense",
+    TRUE ~ analysis_id
+  )
+  paste(prefix, suffix, sep = "_")
+}
+
+# =========================
+# 3) Read and prepare raw data
+# =========================
+infile <- file.path(data_dir, file_name)
+raw <- readxl::read_excel(infile, sheet = sheet_name)
+
+name_map <- c(
+  "StudyID" = "StudyID", "Study_Id" = "StudyID", "Number" = "StudyID",
+  "SystemID" = "SystemID", "System_Id" = "SystemID",
+  "ComparisonType" = "ComparisonType", "ComparsionType" = "ComparisonType", "Comparison" = "ComparisonType",
+  "InvasiveSpecies" = "InvasiveSpecies", "InvasiveSpec" = "InvasiveSpecies",
+  "ComparatorSpecies" = "ComparatorSpecies", "ComparatorSpec" = "ComparatorSpecies",
+  "Trait" = "Trait", "TraitCategory" = "TraitCategory", "TraitForm" = "TraitForm",
+  "Treatment" = "Treatment", "Tissue" = "Tissue", "ExperimentType" = "ExperimentType",
+  "PairDesign" = "PairDesign", "DataLevel" = "DataLevel", "PairingLevel" = "PairingLevel",
+  "UseForRegression" = "UseForRegression",
+  "Mc" = "Mc", "SDc" = "SDc", "Nc" = "Nc",
+  "Mi" = "Mi", "SDi" = "SDi", "Sdi" = "SDi", "Ni" = "Ni",
+  "Unit" = "Unit", "FigureTable" = "FigureTable", "FigTable" = "FigureTable",
+  "Notes" = "Notes", "Note" = "Notes"
+)
+for (old in names(name_map)) {
+  if (old %in% names(raw) && !(name_map[[old]] %in% names(raw))) {
+    names(raw)[names(raw) == old] <- name_map[[old]]
+  }
+}
+
+required <- c("StudyID", "SystemID", "ComparisonType", "InvasiveSpecies", "ComparatorSpecies",
+              "Trait", "TraitCategory", "Treatment", "Tissue", "ExperimentType", "PairDesign",
+              "DataLevel", "PairingLevel", "UseForRegression", "Mc", "SDc", "Nc", "Mi", "SDi", "Ni")
+missing_cols <- setdiff(required, names(raw))
+if (length(missing_cols) > 0) {
+  stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+if (!("TraitForm" %in% names(raw))) raw$TraitForm <- NA_character_
+if (!("Unit" %in% names(raw))) raw$Unit <- NA_character_
+if (!("FigureTable" %in% names(raw))) raw$FigureTable <- NA_character_
+if (!("Notes" %in% names(raw))) raw$Notes <- NA_character_
+
+raw_clean <- raw %>%
+  dplyr::mutate(
+    RowID = dplyr::row_number(),
+    StudyID = clean_key(.data$StudyID),
+    SystemID = clean_key(.data$SystemID),
+    ComparisonType = std_text(.data$ComparisonType),
+    InvasiveSpecies = as.character(.data$InvasiveSpecies),
+    ComparatorSpecies = as.character(.data$ComparatorSpecies),
+    Trait = std_trait(.data$Trait),
+    TraitCategory = std_text(.data$TraitCategory),
+    TraitForm = std_text(.data$TraitForm),
+    Treatment = std_text(.data$Treatment),
+    Tissue = std_text(.data$Tissue),
+    ExperimentType = std_text(.data$ExperimentType),
+    PairDesign = std_text(.data$PairDesign),
+    DataLevel = std_text(.data$DataLevel),
+    PairingLevel = std_text(.data$PairingLevel),
+    UseForRegression = std_text(.data$UseForRegression),
+    Mc = as.numeric(.data$Mc), SDc = as.numeric(.data$SDc), Nc = as.numeric(.data$Nc),
+    Mi = as.numeric(.data$Mi), SDi = as.numeric(.data$SDi), Ni = as.numeric(.data$Ni),
+    Unit = as.character(.data$Unit),
+    FigureTable = as.character(.data$FigureTable),
+    Notes = as.character(.data$Notes)
+  ) %>%
+  dplyr::mutate(
+    TraitCategory = dplyr::if_else(force_lignin_to_physical & Trait == "Lignin", "physical_defense", TraitCategory),
+    d_value = Mi - Mc,
+    Var_d = var_delta(SDc, Nc, SDi, Ni),
+    valid_diff = is.finite(Mi) & is.finite(Mc) & is.finite(SDi) & is.finite(SDc) &
+      is.finite(Ni) & is.finite(Nc) & Ni > 0 & Nc > 0 & SDi >= 0 & SDc >= 0 &
+      is.finite(d_value) & is.finite(Var_d) & Var_d >= 0,
+    lnRR_value = dplyr::if_else(Mi > 0 & Mc > 0, log(Mi / Mc), NA_real_),
+    Var_lnRR = var_lnrr(Mc, SDc, Nc, Mi, SDi, Ni),
+    valid_lnrr = is.finite(lnRR_value) & is.finite(Var_lnRR) & Var_lnRR >= 0 &
+      Mi > 0 & Mc > 0 & Ni > 0 & Nc > 0 & SDi >= 0 & SDc >= 0
+  )
+
+# =========================
+# 4) Build fit data
+# =========================
+make_analysis_base <- function(comparison_type, metric) {
+  valid_col <- if (metric == "LNRR") "valid_lnrr" else "valid_diff"
+  dat <- raw_clean %>%
+    dplyr::filter(
+      .data[[valid_col]],
+      ComparisonType == std_text(comparison_type),
+      UseForRegression %in% std_text(use_for_regression_keep),
+      PairingLevel %in% std_text(pairing_level_keep),
+      DataLevel %in% std_text(data_level_keep)
+    )
+  if (length(tissue_keep) > 0) dat <- dat %>% dplyr::filter(Tissue %in% std_text(tissue_keep))
+  dat
+}
+
+build_fit_data <- function(analysis_base, plan_row, comparison_type, metric) {
+  x_trait <- plan_row$x_trait
+  y_category <- plan_row$y_category
+  analysis_id <- plan_row$analysis_id
+
+  value_col <- if (metric == "LNRR") "lnRR_value" else "d_value"
+  var_col   <- if (metric == "LNRR") "Var_lnRR" else "Var_d"
+
+  xdat <- analysis_base %>%
+    dplyr::filter(Trait == x_trait) %>%
+    dplyr::mutate(wX = 1 / pmax(.data[[var_col]], eps)) %>%
+    dplyr::group_by(SystemID) %>%
+    dplyr::summarise(
+      StudyID = dplyr::first(StudyID),
+      ComparisonType = dplyr::first(ComparisonType),
+      InvasiveSpecies = dplyr::first(InvasiveSpecies),
+      ComparatorSpecies = dplyr::first(ComparatorSpecies),
+      Treatment = dplyr::first(Treatment),
+      Tissue = dplyr::first(Tissue),
+      ExperimentType = dplyr::first(ExperimentType),
+      PairDesign = dplyr::first(PairDesign),
+      DataLevel = dplyr::first(DataLevel),
+      PairingLevel = dplyr::first(PairingLevel),
+      XTrait = dplyr::first(Trait),
+      X_value_raw = stats::weighted.mean(.data[[value_col]], w = wX, na.rm = TRUE),
+      Var_X_raw = 1 / sum(wX, na.rm = TRUE),
+      X_n_rows = dplyr::n(),
+      X_RowIDs = paste(RowID, collapse = ";"),
+      .groups = "drop"
+    )
+
+  ydat <- analysis_base %>%
+    dplyr::filter(TraitCategory == y_category, !(Trait %in% c("C", "N", "P"))) %>%
+    dplyr::transmute(
+      SystemID, StudyID, Y_RowID = RowID,
+      YTrait = Trait,
+      YTraitCategory = TraitCategory,
+      YTraitForm = TraitForm,
+      YUnit = Unit,
+      YFigureTable = FigureTable,
+      Y_value_raw = .data[[value_col]],
+      Var_Y_raw = pmax(.data[[var_col]], eps),
+      Mi_y = Mi, Mc_y = Mc, SDi_y = SDi, SDc_y = SDc, Ni_y = Ni, Nc_y = Nc,
+      Notes
+    )
+
+  fit <- ydat %>%
+    dplyr::inner_join(xdat, by = c("SystemID", "StudyID")) %>%
+    dplyr::mutate(
+      analysis_id = analysis_id,
+      comparison_type = comparison_type,
+      metric = metric,
+      x_trait = x_trait,
+      y_category = y_category
+    )
+
+  if (nrow(fit) == 0) return(fit)
+
+  if (metric == "LNRR") {
+    fit <- standardize_lnrr_if_needed(fit)
+  } else {
+    fit <- standardize_diff(fit)
+  }
+
+  fit <- fit %>%
+    dplyr::filter(is.finite(zX), is.finite(zY), is.finite(vi), vi > 0) %>%
+    dplyr::mutate(
+      weight_raw = 1 / pmax(vi, eps),
+      w_for_model = weight_raw,
+      RegressionID = paste(SystemID, metric, x_trait, YTrait, Y_RowID, sep = "__")
+    )
+
+  if (isTRUE(cap_wls_weights) && nrow(fit) >= 4) {
+    cap <- stats::quantile(fit$w_for_model, probs = weight_cap_quantile, na.rm = TRUE)
+    if (is.finite(cap) && cap > 0) fit$w_for_model <- pmin(fit$w_for_model, cap)
+  }
+  fit
+}
+
+make_diagnostics <- function(analysis_base) {
+  analysis_base %>%
+    dplyr::group_by(ComparisonType, SystemID) %>%
+    dplyr::summarise(
+      StudyID = dplyr::first(StudyID),
+      InvasiveSpecies = dplyr::first(InvasiveSpecies),
+      ComparatorSpecies = dplyr::first(ComparatorSpecies),
+      has_C = any(Trait == "C"),
+      has_N = any(Trait == "N"),
+      has_P = any(Trait == "P"),
+      n_physical = sum(TraitCategory == "physical_defense" & !(Trait %in% c("C", "N", "P"))),
+      n_chemical = sum(TraitCategory == "chemical_defense" & !(Trait %in% c("C", "N", "P"))),
+      traits = paste(sort(unique(Trait)), collapse = "; "),
+      .groups = "drop"
+    )
+}
+
+# =========================
+# 5) Model runners
+# =========================
+fit_formula <- function(form) {
+  if (form == "quadratic") stats::as.formula("zY ~ zX + I(zX^2)") else stats::as.formula("zY ~ zX")
+}
+
+predict_band_lm <- function(fit, df, form, robust_vcov = NULL) {
+  xg <- make_xgrid(df$zX)
+  newdat <- data.frame(zX = xg)
+  if (is.null(robust_vcov)) {
+    pr <- stats::predict(fit, newdata = newdat, se.fit = TRUE)
+    tval <- stats::qt(0.975, df = max(1, fit$df.residual))
+    return(data.frame(x = xg, fit = as.numeric(pr$fit),
+                      lwr = as.numeric(pr$fit - tval * pr$se.fit),
+                      upr = as.numeric(pr$fit + tval * pr$se.fit)))
+  }
+  mm <- stats::model.matrix(fit_formula(form), data = newdat)
+  b <- stats::coef(fit)
+  common <- intersect(colnames(mm), names(b))
+  mm <- mm[, common, drop = FALSE]
+  b <- b[common]
+  V <- robust_vcov[common, common, drop = FALSE]
+  fitv <- as.numeric(mm %*% b)
+  se <- sqrt(pmax(0, rowSums((mm %*% V) * mm)))
+  df_ci <- max(5, dplyr::n_distinct(df$StudyID) - 1)
+  tval <- stats::qt(0.975, df = df_ci)
+  data.frame(x = xg, fit = fitv, lwr = fitv - tval * se, upr = fitv + tval * se)
+}
+
+extract_cr2_p <- function(ct, term = "zX") {
+  p_cols <- grep("^p", names(ct), value = TRUE)
+  if (length(p_cols) == 0) return(NA_real_)
+  term_cols <- intersect(c("term", "Term", "Coef", "coef"), names(ct))
+  if (length(term_cols) > 0) {
+    idx <- which(as.character(ct[[term_cols[1]]]) == term)
+  } else {
+    idx <- which(rownames(ct) == term)
+  }
+  if (length(idx) == 0) return(NA_real_)
+  as.numeric(ct[[p_cols[1]]][idx[1]])
+}
+
+run_WLS <- function(df, form = "linear") {
+  f <- fit_formula(form)
+  fit <- stats::lm(f, data = df, weights = w_for_model)
+  s <- summary(fit)
+  b <- stats::coef(fit)
+  b0 <- unname(b[1])
+  b1 <- if ("zX" %in% names(b)) unname(b["zX"]) else NA_real_
+  b2 <- if ("I(zX^2)" %in% names(b)) unname(b["I(zX^2)"]) else 0
+  p <- tryCatch(as.numeric(s$coefficients["zX", 4]), error = function(e) NA_real_)
+  p2 <- tryCatch(as.numeric(s$coefficients["I(zX^2)", 4]), error = function(e) NA_real_)
+  r2 <- weighted_R2(df$zY, stats::fitted(fit), df$w_for_model, clamp_zero = TRUE)
+  band <- predict_band_lm(fit, df, form)
+  list(method = paste0("WLS_", form), model_family = "WLS", model_form = form, fit = fit,
+       b0 = b0, b1 = b1, b2 = b2, p = p, p_quadratic = p2, R2 = r2,
+       AIC = safe_AIC(fit), band = band)
+}
+
+run_WLS_CR2 <- function(df, form = "linear") {
+  if (dplyr::n_distinct(df$StudyID) < 2) stop("WLS_CR2 requires at least two StudyID clusters.")
+  df2 <- as.data.frame(df)
+  f <- fit_formula(form)
+  fit <- stats::lm(f, data = df2, weights = w_for_model, model = TRUE, x = TRUE, y = TRUE)
+  Vcr <- clubSandwich::vcovCR(fit, cluster = df2$StudyID, type = "CR2")
+  ct <- clubSandwich::coef_test(fit, vcov = Vcr, test = "Satterthwaite")
+  b <- stats::coef(fit)
+  b0 <- unname(b[1])
+  b1 <- if ("zX" %in% names(b)) unname(b["zX"]) else NA_real_
+  b2 <- if ("I(zX^2)" %in% names(b)) unname(b["I(zX^2)"]) else 0
+  p <- extract_cr2_p(ct, "zX")
+  p2 <- extract_cr2_p(ct, "I(zX^2)")
+  r2 <- weighted_R2(df2$zY, stats::fitted(fit), df2$w_for_model, clamp_zero = TRUE)
+  band <- predict_band_lm(fit, df2, form, robust_vcov = Vcr)
+  list(method = paste0("WLS_CR2_", form), model_family = "WLS_CR2", model_form = form, fit = fit,
+       b0 = b0, b1 = b1, b2 = b2, p = p, p_quadratic = p2, R2 = r2,
+       AIC = safe_AIC(fit), band = band)
+}
+
+run_rma_uni <- function(df, form = "linear") {
+  if (form == "quadratic") {
+    res <- metafor::rma.uni(yi = zY, vi = vi, mods = ~ zX + I(zX^2), method = "REML", data = df)
+  } else {
+    res <- metafor::rma.uni(yi = zY, vi = vi, mods = ~ zX, method = "REML", data = df)
+  }
+  b <- stats::coef(res)
+  b0 <- unname(b[1])
+  b1 <- if ("zX" %in% names(b)) unname(b["zX"]) else NA_real_
+  b2 <- if ("I(zX^2)" %in% names(b)) unname(b["I(zX^2)"]) else 0
+  p <- tryCatch(as.numeric(res$pval[which(names(b) == "zX")]), error = function(e) NA_real_)
+  p2 <- tryCatch(as.numeric(res$pval[which(names(b) == "I(zX^2)")]), error = function(e) NA_real_)
+  xg <- make_xgrid(df$zX)
+  if (form == "quadratic") pr <- stats::predict(res, newmods = cbind(xg, xg^2)) else pr <- stats::predict(res, newmods = xg)
+  band <- data.frame(x = xg, fit = as.numeric(pr$pred), lwr = as.numeric(pr$ci.lb), upr = as.numeric(pr$ci.ub))
+  r2 <- weighted_R2_from_coefs(df, b0, b1, b2)
+  list(method = paste0("rma_uni_", form), model_family = "rma_uni", model_form = form, fit = res,
+       b0 = b0, b1 = b1, b2 = b2, p = p, p_quadratic = p2, R2 = r2,
+       AIC = safe_AIC(res), band = band)
+}
+
+run_rma_mv <- function(df, form = "linear") {
+  if (nrow(df) < 6 || dplyr::n_distinct(df$StudyID) < 2) stop("rma_mv requires >=6 rows and >=2 StudyID clusters.")
+  mods <- if (form == "quadratic") ~ zX + I(zX^2) else ~ zX
+  random_arg <- if (rma_mv_random_structure == "StudyID_SystemID") list(~ 1 | StudyID, ~ 1 | SystemID) else ~ 1 | StudyID
+  res <- metafor::rma.mv(yi = zY, V = vi, mods = mods, random = random_arg,
+                         method = "REML", data = df,
+                         control = list(optimizer = "optim", optmethod = "Nelder-Mead"))
+  b <- stats::coef(res)
+  b0 <- unname(b[1])
+  b1 <- if ("zX" %in% names(b)) unname(b["zX"]) else NA_real_
+  b2 <- if ("I(zX^2)" %in% names(b)) unname(b["I(zX^2)"]) else 0
+  p <- tryCatch(as.numeric(res$pval[which(names(b) == "zX")]), error = function(e) NA_real_)
+  p2 <- tryCatch(as.numeric(res$pval[which(names(b) == "I(zX^2)")]), error = function(e) NA_real_)
+  xg <- make_xgrid(df$zX)
+  if (form == "quadratic") pr <- stats::predict(res, newmods = cbind(xg, xg^2)) else pr <- stats::predict(res, newmods = xg)
+  band <- data.frame(x = xg, fit = as.numeric(pr$pred), lwr = as.numeric(pr$ci.lb), upr = as.numeric(pr$ci.ub))
+  r2 <- weighted_R2_from_coefs(df, b0, b1, b2)
+  list(method = paste0("rma_mv_", form), model_family = "rma_mv", model_form = form, fit = res,
+       b0 = b0, b1 = b1, b2 = b2, p = p, p_quadratic = p2, R2 = r2,
+       AIC = safe_AIC(res), band = band)
+}
+
+run_lmrob <- function(df, form = "linear") {
+  f <- fit_formula(form)
+  fit <- robustbase::lmrob(f, data = df, weights = w_for_model)
+  s <- summary(fit)
+  b <- stats::coef(fit)
+  b0 <- unname(b[1])
+  b1 <- if ("zX" %in% names(b)) unname(b["zX"]) else NA_real_
+  b2 <- if ("I(zX^2)" %in% names(b)) unname(b["I(zX^2)"]) else 0
+  p <- tryCatch(as.numeric(s$coefficients["zX", 4]), error = function(e) NA_real_)
+  p2 <- tryCatch(as.numeric(s$coefficients["I(zX^2)", 4]), error = function(e) NA_real_)
+  r2 <- weighted_R2(df$zY, stats::fitted(fit), df$w_for_model, clamp_zero = TRUE)
+  V <- as.matrix(stats::vcov(fit))
+  band <- tryCatch({
+    xg <- make_xgrid(df$zX)
+    newdat <- data.frame(zX = xg)
+    mm <- stats::model.matrix(fit_formula(form), data = newdat)
+    common <- intersect(colnames(mm), names(b))
+    mm <- mm[, common, drop = FALSE]
+    bb <- b[common]
+    VV <- V[common, common, drop = FALSE]
+    fitv <- as.numeric(mm %*% bb)
+    se <- sqrt(pmax(0, rowSums((mm %*% VV) * mm)))
+    tval <- stats::qt(0.975, df = max(5, nrow(df) - length(b)))
+    data.frame(x = xg, fit = fitv, lwr = fitv - tval * se, upr = fitv + tval * se)
+  }, error = function(e) data.frame(x = numeric(), fit = numeric(), lwr = numeric(), upr = numeric()))
+  list(method = paste0("lmrob_", form), model_family = "lmrob", model_form = form, fit = fit,
+       b0 = b0, b1 = b1, b2 = b2, p = p, p_quadratic = p2, R2 = r2,
+       AIC = safe_AIC(fit), band = band)
+}
+
+run_model <- function(df, method, form) {
+  if (nrow(df) < ifelse(form == "quadratic", 6, 3)) stop("too few rows for model")
+  switch(
+    method,
+    WLS = run_WLS(df, form),
+    WLS_CR2 = run_WLS_CR2(df, form),
+    rma_uni = run_rma_uni(df, form),
+    rma_mv = run_rma_mv(df, form),
+    lmrob = run_lmrob(df, form),
+    stop("Unknown method: ", method)
+  )
+}
+
+# =========================
+# 6) Plot function
+# =========================
+build_plot <- function(df, res, comparison_type, plan_row, dataset_tag, metric) {
+  labs <- get_axis_labels(comparison_type, plan_row$x_trait, plan_row$y_category, metric)
+  if (nrow(df) < 3 || !is.finite(res$b1) || nrow(res$band) == 0) return(NULL)
+
+  r2_label <- paste0("R² = ", fmt_num(res$R2, 3))
+  line_type <- "dashed"  # user-requested final style: blue dashed fit line for all selected plots
+
+  df <- df %>% dplyr::mutate(point_weight = w_for_model)
+
+  ## Panel limits are based on observed points. This keeps the visual scale comparable to V4
+  ## and avoids compressing points because of very wide edge confidence intervals.
+  xr <- range(df$zX, na.rm = TRUE)
+  yr <- range(df$zY, na.rm = TRUE)
+  if (!all(is.finite(xr)) || diff(xr) == 0) xr <- c(-1, 1)
+  if (!all(is.finite(yr)) || diff(yr) == 0) yr <- c(-1, 1)
+  xpad <- 0.08 * diff(xr); if (!is.finite(xpad) || xpad == 0) xpad <- 0.2
+  ypad <- 0.10 * diff(yr); if (!is.finite(ypad) || ypad == 0) ypad <- 0.2
+  xlim <- c(xr[1] - xpad, xr[2] + xpad)
+  ylim <- c(yr[1] - ypad, yr[2] + ypad)
+
+  ## Prepare fitted curve and confidence ribbon.
+  ## Important: the model and R2 are unchanged. These operations only affect plotting.
+  band0 <- res$band %>%
+    dplyr::filter(is.finite(x), is.finite(fit), is.finite(lwr), is.finite(upr)) %>%
+    dplyr::arrange(x)
+  if (nrow(band0) == 0) return(NULL)
+
+  ## Avoid very wide CI polygons at extreme x values. This is common for quadratic WLS fits
+  ## when only one or two observations occur near an edge. Such ribbons can visually dominate
+  ## the panel while adding little useful information. We trim only the ribbon in those unstable
+  ## regions; the fitted curve and all observed points remain plotted.
+  band_ribbon <- band0
+  if (isTRUE(trim_unstable_ci_edges) && nrow(band_ribbon) >= min_ci_points_to_draw) {
+    y_iqr <- stats::IQR(df$zY, na.rm = TRUE)
+    if (!is.finite(y_iqr) || y_iqr <= 0) y_iqr <- diff(yr)
+    if (!is.finite(y_iqr) || y_iqr <= 0) y_iqr <- 1
+    max_ci_width <- ci_width_cap_multiplier * y_iqr
+    band_ribbon <- band_ribbon %>%
+      dplyr::mutate(ci_width = upr - lwr) %>%
+      dplyr::filter(is.finite(ci_width), ci_width <= max_ci_width) %>%
+      dplyr::select(-ci_width)
+    if (nrow(band_ribbon) < min_ci_points_to_draw) {
+      ## If trimming removes almost everything, keep no ribbon rather than drawing an ugly polygon.
+      band_ribbon <- band0[0, ]
+    }
+  }
+
+  ## Clip ribbon limits to the observed-data panel so grey bands do not overflow the axes.
+  if (nrow(band_ribbon) > 0) {
+    band_ribbon <- band_ribbon %>%
+      dplyr::mutate(lwr = pmax(lwr, ylim[1]), upr = pmin(upr, ylim[2]))
+  }
+
+  ## The fitted line is also clipped by the panel. Keeping clip = "on" prevents the curve
+  ## from extending into the margins, which happened in the LNRR C -> chemical sensitivity panel.
+  band_line <- band0 %>%
+    dplyr::filter(x >= xlim[1], x <= xlim[2])
+  if (nrow(band_line) == 0) return(NULL)
+
+  ann_x <- xlim[1] + 0.035 * diff(xlim)
+  ann_y <- ylim[2] - 0.045 * diff(ylim)
+
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = zX, y = zY)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.55, color = "grey78") +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.55, color = "grey78")
+
+  if (nrow(band_ribbon) > 0) {
+    p <- p + ggplot2::geom_ribbon(
+      data = band_ribbon,
+      ggplot2::aes(x = x, ymin = lwr, ymax = upr),
+      inherit.aes = FALSE,
+      fill = "grey72",
+      alpha = 0.30
+    )
+  }
+
+  p +
+    ggplot2::geom_line(
+      data = band_line,
+      ggplot2::aes(x = x, y = fit),
+      inherit.aes = FALSE,
+      linewidth = 1.15,
+      linetype = line_type,
+      color = "#1F5FBF"
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(size = point_weight),
+      shape = 21,
+      fill = "grey35",
+      color = "black",
+      alpha = 0.72,
+      stroke = 0.25
+    ) +
+    ggplot2::scale_size_continuous(range = point_size_range, guide = "none") +
+    ggplot2::annotate("text", x = ann_x, y = ann_y, label = r2_label,
+                      hjust = 0, vjust = 1, size = 5.5, fontface = "bold") +
+    ggplot2::coord_cartesian(xlim = xlim, ylim = ylim, clip = ifelse(isTRUE(clip_panel), "on", "off")) +
+    ggplot2::labs(x = labs$x, y = labs$y) +
+    ggplot2::theme_classic(base_size = base_font_size) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_blank(),
+      plot.subtitle = ggplot2::element_blank(),
+      axis.title = ggplot2::element_text(size = base_font_size + 1, face = "bold"),
+      axis.text = ggplot2::element_text(size = base_font_size - 1, color = "black"),
+      axis.line = ggplot2::element_line(linewidth = 0.9, color = "black"),
+      axis.ticks = ggplot2::element_line(linewidth = 0.9, color = "black"),
+      plot.margin = ggplot2::margin(8, 12, 8, 12)
+    )
+}
+
+# =========================
+# 7) Run analyses
+# =========================
+all_prepared <- list()
+all_summaries <- list()
+all_diagnostics <- list()
+all_weight_diagnostics <- list()
+
+for (metric in metric_to_run) {
+  for (cmp in comparison_to_run) {
+    if (!should_run_selected_task(metric, cmp)) {
+      message("Skipping metric: ", metric, " | comparison: ", cmp, " (not in selected final task set)")
+      next
+    }
+    message("Running selected metric: ", metric, " | comparison: ", cmp)
+    base_cmp <- make_analysis_base(cmp, metric)
+    all_diagnostics[[paste(metric, cmp, "coverage", sep = "__")]] <- make_diagnostics(base_cmp) %>%
+      dplyr::mutate(Metric = metric)
+
+    methods_for_metric <- if (metric == "LNRR") lnrr_model_methods else diff_model_methods
+
+    for (i in seq_len(nrow(analysis_plan))) {
+      plan_row <- analysis_plan[i, ]
+      dat_raw <- build_fit_data(base_cmp, plan_row, cmp, metric)
+
+      dat_list <- list(RAW = dat_raw)
+      if (isTRUE(run_iqr_sensitivity)) dat_list$IQR_removed <- iqr_filter_2d(dat_raw, "zX", "zY", iqr_k)
+
+      for (dataset_tag in names(dat_list)) {
+        dat <- dat_list[[dataset_tag]]
+        dat$dataset <- dataset_tag
+        all_prepared[[paste(metric, cmp, plan_row$analysis_id, dataset_tag, sep = "__")]] <- dat
+
+        if (nrow(dat) > 0) {
+          all_weight_diagnostics[[paste(metric, cmp, plan_row$analysis_id, dataset_tag, sep = "__")]] <-
+            dat %>%
+            dplyr::summarise(
+              Metric = dplyr::first(metric),
+              ComparisonType = dplyr::first(ComparisonType),
+              AnalysisID = dplyr::first(analysis_id),
+              Dataset = dplyr::first(dataset),
+              n_rows = dplyr::n(),
+              n_studies = dplyr::n_distinct(StudyID),
+              n_systems = dplyr::n_distinct(SystemID),
+              weight_min = min(w_for_model, na.rm = TRUE),
+              weight_median = stats::median(w_for_model, na.rm = TRUE),
+              weight_mean = mean(w_for_model, na.rm = TRUE),
+              weight_max = max(w_for_model, na.rm = TRUE),
+              weight_max_over_median = max(w_for_model, na.rm = TRUE) / stats::median(w_for_model, na.rm = TRUE),
+              top_weight_study = StudyID[which.max(w_for_model)],
+              top_weight_system = SystemID[which.max(w_for_model)],
+              top_weight_trait = YTrait[which.max(w_for_model)],
+              .groups = "drop"
+            )
+        }
+
+        for (method in methods_for_metric) {
+          for (form in model_forms) {
+            res <- tryCatch(
+              run_model(dat, method, form),
+              error = function(e) {
+                list(method = paste0(method, "_", form), model_family = method, model_form = form,
+                     b0 = NA_real_, b1 = NA_real_, b2 = NA_real_, p = NA_real_, p_quadratic = NA_real_,
+                     R2 = NA_real_, AIC = NA_real_,
+                     band = data.frame(x = numeric(), fit = numeric(), lwr = numeric(), upr = numeric()),
+                     error = e$message)
+              }
+            )
+            if (is.null(res$error)) res$error <- ""
+
+            plot_obj <- build_plot(dat, res, cmp, plan_row, dataset_tag, metric)
+            file_label <- plot_file_label(cmp, plan_row$analysis_id, metric)
+            pdf_file <- NA_character_
+            if (!is.null(plot_obj)) {
+              pdf_file <- paste0(paste(metric, method, form, dataset_tag, file_label, sep = "_"), ".pdf")
+              pdf_path <- file.path(out_dir, pdf_file)
+              ggplot2::ggsave(filename = pdf_path, plot = plot_obj, width = pdf_w, height = pdf_h, device = "pdf")
+            }
+
+            all_summaries[[paste(metric, cmp, plan_row$analysis_id, dataset_tag, method, form, sep = "__")]] <- tibble::tibble(
+              Metric = metric,
+              ComparisonType = cmp,
+              AnalysisID = plan_row$analysis_id,
+              PlotLabel = file_label,
+              XTrait = plan_row$x_trait,
+              YCategory = plan_row$y_category,
+              Dataset = dataset_tag,
+              Method = method,
+              ModelForm = form,
+              n_rows = nrow(dat),
+              n_studies = dplyr::n_distinct(dat$StudyID),
+              n_systems = dplyr::n_distinct(dat$SystemID),
+              n_response_traits = dplyr::n_distinct(dat$YTrait),
+              Intercept = res$b0,
+              Slope_linear = res$b1,
+              Slope_quadratic = res$b2,
+              P_linear = res$p,
+              P_quadratic = res$p_quadratic,
+              R2 = res$R2,
+              AIC = res$AIC,
+              Error = res$error,
+              PdfFile = pdf_file
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+prepared_df <- dplyr::bind_rows(all_prepared)
+summary_df <- dplyr::bind_rows(all_summaries) %>%
+  dplyr::arrange(Metric, ComparisonType, AnalysisID, Dataset, Method, ModelForm)
+diagnostic_df <- dplyr::bind_rows(all_diagnostics, .id = "DiagnosticSet")
+weight_diag_df <- dplyr::bind_rows(all_weight_diagnostics)
+
+expected_pdf_count <- 8
+actual_pdf_count <- sum(!is.na(summary_df$PdfFile) & nzchar(summary_df$PdfFile))
+if (actual_pdf_count != expected_pdf_count) {
+  warning("Expected ", expected_pdf_count, " selected PDFs, but generated ", actual_pdf_count,
+          ". Check Model_Summary$Error and Prepared_Fit_Data for failed/empty model inputs.")
+}
+
+# Dropped/filtered rows by metric.
+dropped_list <- list()
+for (metric in metric_to_run) {
+  valid_col <- if (metric == "LNRR") "valid_lnrr" else "valid_diff"
+  dropped_list[[metric]] <- raw_clean %>%
+    dplyr::mutate(
+      Metric = metric,
+      SelectedComparison = ComparisonType %in% std_text(comparison_to_run),
+      SelectedUse = UseForRegression %in% std_text(use_for_regression_keep),
+      SelectedPairing = PairingLevel %in% std_text(pairing_level_keep),
+      SelectedDataLevel = DataLevel %in% std_text(data_level_keep),
+      SelectedTissue = ifelse(length(tissue_keep) == 0, TRUE, Tissue %in% std_text(tissue_keep)),
+      DropReason = dplyr::case_when(
+        !.data[[valid_col]] ~ paste0("invalid_or_missing_numeric_values_for_", metric),
+        !SelectedComparison ~ "ComparisonType_not_selected",
+        !SelectedUse ~ "UseForRegression_not_selected",
+        !SelectedPairing ~ "PairingLevel_not_selected",
+        !SelectedDataLevel ~ "DataLevel_not_selected",
+        !SelectedTissue ~ "Tissue_not_selected",
+        TRUE ~ "kept_in_base_filter_but_may_not_match_nutrient_defense"
+      )
+    ) %>%
+    dplyr::filter(DropReason != "kept_in_base_filter_but_may_not_match_nutrient_defense")
+}
+dropped_df <- dplyr::bind_rows(dropped_list)
+
+settings_df <- tibble::tibble(
+  Item = c("input_file", "sheet_name", "comparison_to_run", "metric_to_run", "use_for_regression_keep",
+           "pairing_level_keep", "data_level_keep", "tissue_keep", "force_lignin_to_physical",
+           "diff_standardization_mode", "standardize_lnrr", "lnrr_standardization_mode",
+           "run_iqr_sensitivity", "cap_wls_weights", "weight_cap_quantile", "rma_mv_random_structure",
+           "clip_panel", "trim_unstable_ci_edges", "ci_width_cap_multiplier",
+           "main_note", "figure_note", "lnrr_note"),
+  Value = c(infile, as.character(sheet_name), paste(comparison_to_run, collapse = ";"), paste(metric_to_run, collapse = ";"),
+            paste(use_for_regression_keep, collapse = ";"), paste(pairing_level_keep, collapse = ";"),
+            paste(data_level_keep, collapse = ";"), paste(tissue_keep, collapse = ";"),
+            as.character(force_lignin_to_physical), diff_standardization_mode,
+            as.character(standardize_lnrr), lnrr_standardization_mode,
+            as.character(run_iqr_sensitivity), as.character(cap_wls_weights), as.character(weight_cap_quantile),
+            rma_mv_random_structure, as.character(clip_panel), as.character(trim_unstable_ci_edges),
+            as.character(ci_width_cap_multiplier),
+            "Figure 2 module: raw lnRR WLS quadratic for invasive_vs_native; RAW is the main dataset and IQR_removed is a sensitivity analysis.",
+            "Bubble size represents inverse-variance model weight; panels show only R2; plot titles and subtitles are omitted intentionally; all fitted lines are blue dashed.",
+            "LNRR requires positive Mi and Mc. Rows with zero/negative means are excluded from LNRR but may remain in DIFF."
+  )
+)
+
+caption_file <- file.path(out_dir, "figure_caption_notes.txt")
+writeLines(c(
+  "Suggested figure caption notes:",
+  "Points represent trait-level nutrient-defense paired observations generated within the same SystemID.",
+  "Point size is proportional to the inverse-variance model weight.",
+  "Figure 2 panels use raw LNRR WLS quadratic fits for invasive plants relative to native plants.",
+  "All regression lines are blue dashed WLS quadratic fits; slopes, p values, AIC and diagnostics are provided in the accompanying Excel output.",
+  "Panels show only R2 values to reduce clutter; plot titles and subtitles are omitted intentionally.",
+  "For invasive-vs-native comparisons, lnRR = log(invasive/native).",
+  "RAW analyses are the main results; IQR_removed analyses are sensitivity analyses."
+), caption_file)
+
+out_xlsx <- file.path(out_dir, "Figure2_broad_lnRR_RESULTS.xlsx")
+writexl::write_xlsx(
+  list(
+    Prepared_Fit_Data = prepared_df,
+    Model_Summary = summary_df,
+    System_Trait_Coverage = diagnostic_df,
+    Weight_Diagnostics = weight_diag_df,
+    Dropped_Rows = dropped_df,
+    Settings = settings_df
+  ),
+  out_xlsx
+)
+
+message("Done. Output folder: ", out_dir)
+message("Results workbook: ", out_xlsx)
+message("Caption notes: ", caption_file)
+})
+
+# =========================
+# 3) Figure 3 module
+# =========================
+message("Running Figure 3 trait-specific raw-lnRR module...")
+local({
+# =========================
+# 1) USER CONFIG
+# =========================
+data_dir   <- shared_data_dir
+file_name  <- shared_file_name
+sheet_name <- shared_sheet_name
+
+out_dir <- file.path(combined_out_dir, "Figure3_trait_specific_lnRR")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+comparison_to_run <- c("invasive_vs_native")
+
+## Filters for main regression.
+use_for_regression_keep <- c("main")
+pairing_level_keep      <- c("exact", "baseline")
+data_level_keep         <- c("species_pair", "treatment_level", "population_pair")
+tissue_keep             <- c("leaf")   # set character(0) to use all tissues
+
+## Treat lignin as structural/physical defense even if it was entered as chemical_defense.
+force_lignin_to_physical <- TRUE
+
+## DIFF/Cha standardization: closest to the previous difference-fitting logic.
+diff_standardization_mode <- "global_signed_norm"
+
+## LNRR is dimensionless; keep raw lnRR values by default.
+standardize_lnrr <- FALSE
+lnrr_standardization_mode <- "global_signed_norm"
+
+## RAW remains main result; IQR_removed is sensitivity analysis.
+run_iqr_sensitivity <- TRUE
+iqr_k <- 1.5
+
+## Optional weight capping. Keep FALSE for transparent main output.
+cap_wls_weights <- FALSE
+weight_cap_quantile <- 0.99
+
+## Minimum rows for fitting candidate WLS models.
+min_n_linear <- 3
+min_n_quadratic <- 6
+
+## Model-selection thresholds for deciding whether a fitted relationship is usable.
+## IMPORTANT:
+##   The two comparison types have different replication realities.
+##   invasive_vs_native usually has more studies, so StudyID >= 3 is retained.
+##   introduced_vs_native_range is rare, so StudyID >= 2 is allowed, but results are
+##   handled by predefined comparison-specific replication criteria.
+##   R2 and p-value are not used to cherry-pick plots; a model must still have
+##   sufficient explanatory value and a significant fitted term to be exported.
+selection_alpha <- 0.05
+selection_min_r2 <- 0.10
+selection_min_n <- 10
+selection_min_studies_invasive_vs_native <- 3
+selection_min_studies_introduced_vs_native_range <- 2
+selection_min_systems <- 5
+selection_min_delta_aic_for_quadratic <- 2
+selection_min_delta_r2_for_quadratic <- 0.05
+prefer_quadratic_for_structural_total <- TRUE
+
+## Optional supplementary tier.
+## If TRUE, models that are close but not strict can be exported with
+## SelectionStatus = "selected_supplementary". I recommend keeping this TRUE only for
+## supplementary model inspection; such results should be reported with the criteria used.
+allow_supplementary_output <- TRUE
+selection_alpha_supplementary <- 0.10
+selection_min_r2_supplementary <- 0.08
+
+
+
+## Pairing rule:
+## Nutrient and defense rows are paired by SystemID. Make sure all traits from the
+## same biological comparison unit share exactly the same SystemID. Treatment and
+## tissue columns are retained for diagnostics and filtering, but they are not used
+## to create extra pairing keys in this script.
+
+## Plot settings.
+pdf_w <- 6.8
+pdf_h <- 5.6
+combined_pdf_w <- 11.6
+combined_pdf_h <- 5.6
+funnel_pdf_w <- 6.4
+funnel_pdf_h <- 5.0
+
+## Funnel plot style, matching the standalone funnel-plot program.
+funnel_level <- c(90, 95, 99)
+funnel_shade <- c("white", "grey90", "grey80")
+show_funnel_contour_legend <- TRUE
+show_funnel_nk_on_plot <- TRUE
+min_effects_for_bias_tests <- 10
+run_begg_ranktest <- TRUE
+run_trimfill_for_funnel <- TRUE
+base_font_size <- 18
+point_size_range <- c(3.0, 8.2)
+eps <- 1e-12
+
+## Plot safety controls. These do not change model fitting or reported statistics.
+clip_panel <- TRUE
+trim_unstable_ci_edges <- TRUE
+ci_width_cap_multiplier <- 2.2
+min_ci_points_to_draw <- 12
+ci_trim_quantile <- 0.90
+ribbon_alpha <- 0.24
+
+## Structural material trait list.
+## These are used for the C -> total structural material defense analysis.
+structural_material_traits <- c("Cellulose", "Hemicellulose", "Lignin", "Wax", "Resin", "Latex")
+
+## C-specific traits: C can be fitted against these material defense traits one by one.
+## You can add/remove traits here without changing the rest of the program.
+c_specific_defense_traits <- c(
+  "Cellulose", "Hemicellulose", "Lignin", "Wax", "Resin", "Latex",
+  "Phenolics", "Tannins", "Flavonoids", "Terpenoids", "Saponins", "Glycosides",
+  "Alkaloids", "Glucosinolates", "Proteinaceous toxins"
+)
+
+## N-specific chemical defense traits. P is intentionally not used for trait-specific fitting here.
+n_specific_chemical_traits <- c(
+  "Phenolics", "Tannins", "Flavonoids", "Terpenoids", "Saponins", "Glycosides",
+  "Alkaloids", "Glucosinolates", "Proteinaceous toxins"
+)
+
+# =========================
+# 2) Helper functions
+# =========================
+clean_key <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+  x <- stringr::str_replace_all(x, "\\s+", "_")
+  x <- stringr::str_replace_all(x, "[^A-Za-z0-9_\\-\\.]+", "-")
+  x <- stringr::str_replace_all(x, "-+", "-")
+  x
+}
+
+std_text <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+  x <- stringr::str_replace_all(x, "\\s+", "_")
+  tolower(x)
+}
+
+std_trait <- function(x) {
+  x0 <- stringr::str_trim(as.character(x))
+  x1 <- tolower(x0)
+  x1 <- stringr::str_replace_all(x1, "[_\\-]+", " ")
+  x1 <- stringr::str_squish(x1)
+  dplyr::case_when(
+    x1 %in% c("c", "carbon", "leaf c", "plant c", "total c") ~ "C",
+    x1 %in% c("n", "nitrogen", "leaf n", "plant n", "total n") ~ "N",
+    x1 %in% c("p", "phosphorus", "phosphorous", "leaf p", "plant p", "total p") ~ "P",
+    x1 %in% c("phenolics", "phenolic", "total phenolics", "total phenols", "phenols", "polyphenols") ~ "Phenolics",
+    x1 %in% c("tannins", "tannin", "condensed tannins", "total tannins") ~ "Tannins",
+    x1 %in% c("flavonoids", "flavonoid", "total flavonoids") ~ "Flavonoids",
+    x1 %in% c("terpenoids", "terpene", "terpenes", "total terpenes", "total terpenoids") ~ "Terpenoids",
+    x1 %in% c("alkaloids", "alkaloid", "total alkaloids") ~ "Alkaloids",
+    x1 %in% c("glucosinolates", "glucosinolate") ~ "Glucosinolates",
+    x1 %in% c("glycosides", "glycoside") ~ "Glycosides",
+    x1 %in% c("saponins", "saponin") ~ "Saponins",
+    x1 %in% c("proteinaceous toxins", "protein toxins", "protease inhibitors", "proteinase inhibitors") ~ "Proteinaceous toxins",
+    x1 %in% c("cellulose") ~ "Cellulose",
+    x1 %in% c("hemicellulose", "hemi cellulose") ~ "Hemicellulose",
+    x1 %in% c("lignin") ~ "Lignin",
+    x1 %in% c("wax", "waxes", "leaf wax") ~ "Wax",
+    x1 %in% c("resin", "resins") ~ "Resin",
+    x1 %in% c("latex") ~ "Latex",
+    x1 %in% c("leaf toughness", "toughness") ~ "Leaf toughness",
+    x1 %in% c("leaf thickness", "thickness") ~ "Leaf thickness",
+    x1 %in% c("lma", "leaf mass per area", "leaf mass area") ~ "LMA",
+    x1 %in% c("sla", "specific leaf area") ~ "SLA",
+    x1 %in% c("trichome", "trichomes", "trichome density", "trichome number") ~ "Trichome density",
+    TRUE ~ x0
+  )
+}
+
+fmt_num <- function(x, d = 3) {
+  if (length(x) == 0 || is.na(x) || !is.finite(x)) return("NA")
+  formatC(as.numeric(x), digits = d, format = "f")
+}
+
+fmt_p <- function(p) {
+  if (is.na(p) || !is.finite(p)) return("NA")
+  if (p < 1e-4) return(formatC(p, format = "e", digits = 2))
+  formatC(p, format = "f", digits = 4)
+}
+
+## Map WLS weights to visible point sizes while preserving the relative idea
+## that smaller error / larger weight corresponds to a larger point.
+## A square-root transform softens extreme weight differences and a fixed
+## minimum size keeps low-weight points visible in the final figures.
+rescale_point_sizes <- function(w, size_range = point_size_range) {
+  w <- as.numeric(w)
+  w[!is.finite(w)] <- NA_real_
+  out <- rep(mean(size_range), length(w))
+  ok <- is.finite(w)
+  if (!any(ok)) return(out)
+  base <- sqrt(pmax(w[ok], eps))
+  if (length(unique(round(base, 10))) <= 1) {
+    out[ok] <- mean(size_range)
+    return(out)
+  }
+  out[ok] <- scales::rescale(base, to = size_range, from = range(base, na.rm = TRUE))
+  out <- pmax(size_range[1], pmin(size_range[2], out))
+  out
+}
+
+var_delta <- function(SDc, Nc, SDi, Ni) {
+  (SDi^2) / (Ni + eps) + (SDc^2) / (Nc + eps)
+}
+
+var_lnrr <- function(Mc, SDc, Nc, Mi, SDi, Ni) {
+  (SDi^2) / ((Ni + eps) * (Mi^2 + eps)) +
+    (SDc^2) / ((Nc + eps) * (Mc^2 + eps))
+}
+
+weighted_R2 <- function(y, yhat, w, clamp_zero = TRUE) {
+  ok <- is.finite(y) & is.finite(yhat) & is.finite(w) & w > 0
+  y <- y[ok]; yhat <- yhat[ok]; w <- w[ok]
+  if (length(y) < 3) return(NA_real_)
+  ybar <- sum(w * y) / sum(w)
+  sst <- sum(w * (y - ybar)^2)
+  sse <- sum(w * (y - yhat)^2)
+  if (!is.finite(sst) || sst <= 0) return(NA_real_)
+  r2 <- 1 - sse / sst
+  if (!is.finite(r2)) return(NA_real_)
+  if (isTRUE(clamp_zero)) r2 <- max(0, r2)
+  r2
+}
+
+signed_norm_vec <- function(x, var = NULL, eps2 = 1e-8) {
+  x <- as.numeric(x)
+  if (is.null(var)) var <- rep(NA_real_, length(x))
+  var <- as.numeric(var)
+  z <- rep(NA_real_, length(x))
+  dz <- rep(NA_real_, length(x))
+
+  global_sd <- stats::sd(x[is.finite(x)], na.rm = TRUE)
+  global_mu <- mean(x[is.finite(x)], na.rm = TRUE)
+  if (!is.finite(global_sd) || global_sd <= eps2) global_sd <- 1
+  if (!is.finite(global_mu)) global_mu <- 0
+
+  pos <- x[is.finite(x) & x > 0]
+  neg <- x[is.finite(x) & x < 0]
+  mu_pos <- if (length(pos) >= 2) mean(pos) else global_mu
+  sd_pos <- if (length(pos) >= 2) stats::sd(pos) else global_sd
+  mu_neg <- if (length(neg) >= 2) mean(neg) else global_mu
+  sd_neg <- if (length(neg) >= 2) stats::sd(neg) else global_sd
+  if (!is.finite(sd_pos) || sd_pos <= eps2) sd_pos <- global_sd
+  if (!is.finite(sd_neg) || sd_neg <= eps2) sd_neg <- global_sd
+
+  for (i in seq_along(x)) {
+    if (!is.finite(x[i])) next
+    if (x[i] > 0) {
+      z[i] <- (x[i] - mu_pos) / sd_pos
+      dz[i] <- 1 / sd_pos
+    } else if (x[i] < 0) {
+      z[i] <- (x[i] - mu_neg) / sd_neg
+      dz[i] <- 1 / sd_neg
+    } else {
+      z[i] <- 0
+      dz[i] <- 1 / global_sd
+    }
+  }
+  list(z = z, dz = dz, var_z = (dz^2) * var)
+}
+
+standardize_diff <- function(df) {
+  tx <- signed_norm_vec(df$X_value_raw, df$Var_X_raw)
+  df$zX <- tx$z
+  df$Var_zX <- tx$var_z
+
+  ty_global <- signed_norm_vec(df$Y_value_raw, df$Var_Y_raw)
+  df$zY <- ty_global$z
+  df$vi <- ty_global$var_z
+  df$Y_standardization <- "global_signed_norm"
+
+  if (diff_standardization_mode == "within_trait_signed_norm") {
+    spl <- split(seq_len(nrow(df)), df$YTrait)
+    for (ii in spl) {
+      if (length(ii) >= 3) {
+        ty <- signed_norm_vec(df$Y_value_raw[ii], df$Var_Y_raw[ii])
+        df$zY[ii] <- ty$z
+        df$vi[ii] <- ty$var_z
+        df$Y_standardization[ii] <- "within_trait_signed_norm"
+      }
+    }
+  }
+  df
+}
+
+standardize_lnrr_if_needed <- function(df) {
+  if (!isTRUE(standardize_lnrr)) {
+    df$zX <- df$X_value_raw
+    df$zY <- df$Y_value_raw
+    df$vi <- df$Var_Y_raw
+    df$Var_zX <- df$Var_X_raw
+    df$Y_standardization <- "raw_lnRR_no_standardization"
+    return(df)
+  }
+
+  tx <- signed_norm_vec(df$X_value_raw, df$Var_X_raw)
+  df$zX <- tx$z
+  df$Var_zX <- tx$var_z
+
+  ty_global <- signed_norm_vec(df$Y_value_raw, df$Var_Y_raw)
+  df$zY <- ty_global$z
+  df$vi <- ty_global$var_z
+  df$Y_standardization <- "lnRR_global_signed_norm"
+
+  if (lnrr_standardization_mode == "within_trait_signed_norm") {
+    spl <- split(seq_len(nrow(df)), df$YTrait)
+    for (ii in spl) {
+      if (length(ii) >= 3) {
+        ty <- signed_norm_vec(df$Y_value_raw[ii], df$Var_Y_raw[ii])
+        df$zY[ii] <- ty$z
+        df$vi[ii] <- ty$var_z
+        df$Y_standardization[ii] <- "lnRR_within_trait_signed_norm"
+      }
+    }
+  }
+  df
+}
+
+make_xgrid <- function(x, n = 240) {
+  xr <- range(x, na.rm = TRUE)
+  if (!all(is.finite(xr)) || diff(xr) == 0) return(seq(-1, 1, length.out = n))
+  seq(xr[1], xr[2], length.out = n)
+}
+
+iqr_filter_2d <- function(df, xcol = "zX", ycol = "zY", k = 1.5) {
+  if (nrow(df) < 4) return(df)
+  qx <- stats::quantile(df[[xcol]], probs = c(0.25, 0.75), na.rm = TRUE)
+  qy <- stats::quantile(df[[ycol]], probs = c(0.25, 0.75), na.rm = TRUE)
+  iqx <- qx[2] - qx[1]
+  iqy <- qy[2] - qy[1]
+  lx <- qx[1] - k * iqx
+  ux <- qx[2] + k * iqx
+  ly <- qy[1] - k * iqy
+  uy <- qy[2] + k * iqy
+  df %>% dplyr::filter(.data[[xcol]] >= lx, .data[[xcol]] <= ux,
+                        .data[[ycol]] >= ly, .data[[ycol]] <= uy)
+}
+
+safe_file_label <- function(x) {
+  x <- stringr::str_replace_all(x, "[^A-Za-z0-9_.-]+", "_")
+  x <- stringr::str_replace_all(x, "_+", "_")
+  stringr::str_replace_all(x, "(^_|_$)", "")
+}
+
+get_axis_labels <- function(comparison_type, x_trait, y_label, metric) {
+  if (metric == "LNRR") {
+    list(x = paste0("LNRR-", x_trait), y = paste0("LNRR-", y_label))
+  } else {
+    list(x = paste0("Cha-", x_trait), y = paste0("Cha-", y_label))
+  }
+}
+
+plot_file_label <- function(comparison_type, x_trait, y_label, metric) {
+  prefix <- if (metric == "LNRR") {
+    ifelse(comparison_type == "introduced_vs_native_range", "LNRR_I.range-N.range", "LNRR_INV-NAT")
+  } else {
+    ifelse(comparison_type == "introduced_vs_native_range", "Cha_I.range-N.range", "Diff_INV-NAT")
+  }
+  paste(prefix, paste0("for_", x_trait, "_vs_", safe_file_label(y_label)), sep = "_")
+}
+
+## File-name prefix used for exported PDFs. The internal analysis scale remains
+## "DIFF" for introduced_vs_native_range, but the exported file name uses "Cha"
+## to match the axis labels and manuscript terminology.
+output_metric_label <- function(comparison_type, metric) {
+  if (identical(metric, "DIFF") && identical(comparison_type, "introduced_vs_native_range")) return("Cha")
+  metric
+}
+
+# =========================
+# 3) Analysis target table
+# =========================
+make_target_table <- function() {
+  targets <- list()
+  idx <- 1
+
+  ## C -> total material structural defense.
+  targets[[idx]] <- tibble::tibble(
+    AnalysisOrder = idx,
+    AnalysisID = "C_structural_material_total",
+    XTrait = "C",
+    TargetType = "structural_material_total",
+    YTrait = NA_character_,
+    YCategory = "physical_defense",
+    YLabel = "Structural defense",
+    Notes = paste("Y = physical_defense + material; structural traits:", paste(structural_material_traits, collapse = "; "))
+  )
+  idx <- idx + 1
+
+  ## C -> each specific defense trait.
+  for (tr in c_specific_defense_traits) {
+    targets[[idx]] <- tibble::tibble(
+      AnalysisOrder = idx,
+      AnalysisID = paste0("C_vs_", safe_file_label(tr)),
+      XTrait = "C",
+      TargetType = "specific_trait",
+      YTrait = tr,
+      YCategory = NA_character_,
+      YLabel = tr,
+      Notes = "C fitted against a specific defense material trait."
+    )
+    idx <- idx + 1
+  }
+
+  ## N -> each selected chemical defense trait.
+  for (tr in n_specific_chemical_traits) {
+    targets[[idx]] <- tibble::tibble(
+      AnalysisOrder = idx,
+      AnalysisID = paste0("N_vs_", safe_file_label(tr)),
+      XTrait = "N",
+      TargetType = "specific_trait",
+      YTrait = tr,
+      YCategory = "chemical_defense",
+      YLabel = tr,
+      Notes = "N fitted against a specific chemical defense material trait."
+    )
+    idx <- idx + 1
+  }
+
+  dplyr::bind_rows(targets)
+}
+
+analysis_targets <- make_target_table()
+
+# =========================
+# 4) Read and prepare raw data
+# =========================
+infile <- file.path(data_dir, file_name)
+raw <- readxl::read_excel(infile, sheet = sheet_name)
+
+name_map <- c(
+  "StudyID" = "StudyID", "Study_Id" = "StudyID", "Number" = "StudyID",
+  "SystemID" = "SystemID", "System_Id" = "SystemID",
+  "ComparisonType" = "ComparisonType", "ComparsionType" = "ComparisonType", "Comparison" = "ComparisonType",
+  "InvasiveSpecies" = "InvasiveSpecies", "InvasiveSpec" = "InvasiveSpecies",
+  "ComparatorSpecies" = "ComparatorSpecies", "ComparatorSpec" = "ComparatorSpecies",
+  "Trait" = "Trait", "TraitCategory" = "TraitCategory", "TraitForm" = "TraitForm",
+  "Treatment" = "Treatment", "Tissue" = "Tissue", "ExperimentType" = "ExperimentType",
+  "PairDesign" = "PairDesign", "DataLevel" = "DataLevel", "PairingLevel" = "PairingLevel",
+  "UseForRegression" = "UseForRegression",
+  "Mc" = "Mc", "SDc" = "SDc", "Nc" = "Nc",
+  "Mi" = "Mi", "SDi" = "SDi", "Sdi" = "SDi", "Ni" = "Ni",
+  "Unit" = "Unit", "FigureTable" = "FigureTable", "FigTable" = "FigureTable",
+  "Notes" = "Notes", "Note" = "Notes"
+)
+for (old in names(name_map)) {
+  if (old %in% names(raw) && !(name_map[[old]] %in% names(raw))) {
+    names(raw)[names(raw) == old] <- name_map[[old]]
+  }
+}
+
+required <- c("StudyID", "SystemID", "ComparisonType", "InvasiveSpecies", "ComparatorSpecies",
+              "Trait", "TraitCategory", "Treatment", "Tissue", "ExperimentType", "PairDesign",
+              "DataLevel", "PairingLevel", "UseForRegression", "Mc", "SDc", "Nc", "Mi", "SDi", "Ni")
+missing_cols <- setdiff(required, names(raw))
+if (length(missing_cols) > 0) stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+if (!("TraitForm" %in% names(raw))) raw$TraitForm <- NA_character_
+if (!("Unit" %in% names(raw))) raw$Unit <- NA_character_
+if (!("FigureTable" %in% names(raw))) raw$FigureTable <- NA_character_
+if (!("Notes" %in% names(raw))) raw$Notes <- NA_character_
+
+raw_clean <- raw %>%
+  dplyr::mutate(
+    RowID = dplyr::row_number(),
+    StudyID = clean_key(.data$StudyID),
+    SystemID = clean_key(.data$SystemID),
+    ComparisonType = std_text(.data$ComparisonType),
+    InvasiveSpecies = as.character(.data$InvasiveSpecies),
+    ComparatorSpecies = as.character(.data$ComparatorSpecies),
+    Trait = std_trait(.data$Trait),
+    TraitCategory = std_text(.data$TraitCategory),
+    TraitForm = std_text(.data$TraitForm),
+    Treatment = std_text(.data$Treatment),
+    Tissue = std_text(.data$Tissue),
+    ExperimentType = std_text(.data$ExperimentType),
+    PairDesign = std_text(.data$PairDesign),
+    DataLevel = std_text(.data$DataLevel),
+    PairingLevel = std_text(.data$PairingLevel),
+    UseForRegression = std_text(.data$UseForRegression),
+    Mc = as.numeric(.data$Mc), SDc = as.numeric(.data$SDc), Nc = as.numeric(.data$Nc),
+    Mi = as.numeric(.data$Mi), SDi = as.numeric(.data$SDi), Ni = as.numeric(.data$Ni),
+    Unit = as.character(.data$Unit),
+    FigureTable = as.character(.data$FigureTable),
+    Notes = as.character(.data$Notes)
+  ) %>%
+  dplyr::mutate(
+    TraitCategory = dplyr::if_else(force_lignin_to_physical & Trait == "Lignin", "physical_defense", TraitCategory),
+    TraitForm = dplyr::case_when(
+      Trait %in% c("C", "N", "P") ~ "material",
+      Trait %in% structural_material_traits ~ "material",
+      Trait %in% c("Phenolics", "Tannins", "Flavonoids", "Terpenoids", "Saponins", "Glycosides", "Alkaloids", "Glucosinolates", "Proteinaceous toxins") ~ "material",
+      TRUE ~ TraitForm
+    ),
+    d_value = Mi - Mc,
+    Var_d = var_delta(SDc, Nc, SDi, Ni),
+    valid_diff = is.finite(Mi) & is.finite(Mc) & is.finite(SDi) & is.finite(SDc) &
+      is.finite(Ni) & is.finite(Nc) & Ni > 0 & Nc > 0 & SDi >= 0 & SDc >= 0 &
+      is.finite(d_value) & is.finite(Var_d) & Var_d >= 0,
+    lnRR_value = dplyr::if_else(Mi > 0 & Mc > 0, log(Mi / Mc), NA_real_),
+    Var_lnRR = var_lnrr(Mc, SDc, Nc, Mi, SDi, Ni),
+    valid_lnrr = is.finite(lnRR_value) & is.finite(Var_lnRR) & Var_lnRR >= 0 &
+      Mi > 0 & Mc > 0 & Ni > 0 & Nc > 0 & SDi >= 0 & SDc >= 0
+  )
+
+# =========================
+# 5) Build analysis datasets
+# =========================
+selected_metric_for_comparison <- function(comparison_type) {
+  if (comparison_type == "invasive_vs_native") return("LNRR")
+  if (comparison_type == "introduced_vs_native_range") return("DIFF")
+  stop("Unsupported ComparisonType: ", comparison_type)
+}
+
+make_analysis_base <- function(comparison_type, metric) {
+  valid_col <- if (metric == "LNRR") "valid_lnrr" else "valid_diff"
+  dat <- raw_clean %>%
+    dplyr::filter(
+      .data[[valid_col]],
+      ComparisonType == std_text(comparison_type),
+      UseForRegression %in% std_text(use_for_regression_keep),
+      PairingLevel %in% std_text(pairing_level_keep),
+      DataLevel %in% std_text(data_level_keep)
+    )
+  if (length(tissue_keep) > 0) dat <- dat %>% dplyr::filter(Tissue %in% std_text(tissue_keep))
+  dat
+}
+
+filter_y_by_target <- function(analysis_base, target_row) {
+  target_type <- target_row$TargetType
+  if (target_type == "structural_material_total") {
+    analysis_base %>%
+      dplyr::filter(
+        TraitCategory == "physical_defense",
+        TraitForm == "material",
+        Trait %in% structural_material_traits,
+        !(Trait %in% c("C", "N", "P"))
+      )
+  } else if (target_type == "specific_trait") {
+    ydat <- analysis_base %>% dplyr::filter(Trait == target_row$YTrait)
+    if (!is.na(target_row$YCategory) && nzchar(target_row$YCategory)) {
+      ydat <- ydat %>% dplyr::filter(TraitCategory == target_row$YCategory)
+    }
+    ydat %>% dplyr::filter(!(Trait %in% c("C", "N", "P")))
+  } else {
+    stop("Unknown TargetType: ", target_type)
+  }
+}
+
+build_fit_data <- function(analysis_base, target_row, comparison_type, metric) {
+  x_trait <- target_row$XTrait
+  value_col <- if (metric == "LNRR") "lnRR_value" else "d_value"
+  var_col   <- if (metric == "LNRR") "Var_lnRR" else "Var_d"
+
+  xdat <- analysis_base %>%
+    dplyr::filter(Trait == x_trait) %>%
+    dplyr::mutate(wX = 1 / pmax(.data[[var_col]], eps)) %>%
+    dplyr::group_by(SystemID) %>%
+    dplyr::summarise(
+      StudyID = dplyr::first(StudyID),
+      ComparisonType = dplyr::first(ComparisonType),
+      InvasiveSpecies = dplyr::first(InvasiveSpecies),
+      ComparatorSpecies = dplyr::first(ComparatorSpecies),
+      Treatment = dplyr::first(Treatment),
+      Tissue = dplyr::first(Tissue),
+      ExperimentType = dplyr::first(ExperimentType),
+      PairDesign = dplyr::first(PairDesign),
+      DataLevel = dplyr::first(DataLevel),
+      PairingLevel = dplyr::first(PairingLevel),
+      XTrait = dplyr::first(Trait),
+      X_value_raw = stats::weighted.mean(.data[[value_col]], w = wX, na.rm = TRUE),
+      Var_X_raw = 1 / sum(wX, na.rm = TRUE),
+      X_n_rows = dplyr::n(),
+      X_RowIDs = paste(RowID, collapse = ";"),
+      .groups = "drop"
+    )
+
+  yraw <- filter_y_by_target(analysis_base, target_row)
+  ydat <- yraw %>%
+    dplyr::transmute(
+      SystemID, StudyID, Y_RowID = RowID,
+      YTrait = Trait,
+      YTraitCategory = TraitCategory,
+      YTraitForm = TraitForm,
+      YUnit = Unit,
+      YFigureTable = FigureTable,
+      Y_value_raw = .data[[value_col]],
+      Var_Y_raw = pmax(.data[[var_col]], eps),
+      Mi_y = Mi, Mc_y = Mc, SDi_y = SDi, SDc_y = SDc, Ni_y = Ni, Nc_y = Nc,
+      Notes
+    )
+
+  fit <- ydat %>%
+    ## Pair nutrients and defense traits primarily by SystemID.
+    ## SystemID is the user-defined biological comparison unit.
+    dplyr::inner_join(xdat, by = "SystemID", suffix = c("_Y", "_X")) %>%
+    dplyr::mutate(
+      StudyID = dplyr::coalesce(.data$StudyID_Y, .data$StudyID_X),
+      AnalysisOrder = target_row$AnalysisOrder,
+      AnalysisID = target_row$AnalysisID,
+      TargetType = target_row$TargetType,
+      comparison_type = comparison_type,
+      metric = metric,
+      x_trait = x_trait,
+      y_label = target_row$YLabel,
+      y_target_trait = target_row$YTrait
+    ) %>%
+    dplyr::select(-dplyr::any_of(c("StudyID_Y", "StudyID_X")))
+
+  if (nrow(fit) == 0) return(fit)
+
+  if (metric == "LNRR") {
+    fit <- standardize_lnrr_if_needed(fit)
+  } else {
+    fit <- standardize_diff(fit)
+  }
+
+  fit <- fit %>%
+    dplyr::filter(is.finite(zX), is.finite(zY), is.finite(vi), vi > 0) %>%
+    dplyr::mutate(
+      weight_raw = 1 / pmax(vi, eps),
+      w_for_model = weight_raw,
+      RegressionID = paste(SystemID, metric, x_trait, YTrait, Y_RowID, sep = "__")
+    )
+
+  if (isTRUE(cap_wls_weights) && nrow(fit) >= 4) {
+    cap <- stats::quantile(fit$w_for_model, probs = weight_cap_quantile, na.rm = TRUE)
+    if (is.finite(cap) && cap > 0) fit$w_for_model <- pmin(fit$w_for_model, cap)
+  }
+  fit
+}
+
+make_diagnostics <- function(analysis_base) {
+  analysis_base %>%
+    dplyr::group_by(ComparisonType, SystemID) %>%
+    dplyr::summarise(
+      StudyID = dplyr::first(StudyID),
+      InvasiveSpecies = dplyr::first(InvasiveSpecies),
+      ComparatorSpecies = dplyr::first(ComparatorSpecies),
+      has_C = any(Trait == "C"),
+      has_N = any(Trait == "N"),
+      has_P = any(Trait == "P"),
+      n_material_physical = sum(TraitCategory == "physical_defense" & TraitForm == "material" & !(Trait %in% c("C", "N", "P"))),
+      n_chemical = sum(TraitCategory == "chemical_defense" & !(Trait %in% c("C", "N", "P"))),
+      traits = paste(sort(unique(Trait)), collapse = "; "),
+      .groups = "drop"
+    )
+}
+
+
+# =========================
+# 6) Candidate WLS models, automatic selection, and plotting
+# =========================
+run_WLS_model <- function(df, model_form = c("linear", "quadratic")) {
+  model_form <- match.arg(model_form)
+  min_n <- if (model_form == "quadratic") min_n_quadratic else min_n_linear
+  if (nrow(df) < min_n) stop(paste0("too few rows for WLS ", model_form))
+  if (length(unique(df$zX[is.finite(df$zX)])) < ifelse(model_form == "quadratic", 3, 2)) {
+    stop(paste0("too few unique x values for WLS ", model_form))
+  }
+
+  if (model_form == "quadratic") {
+    fit <- stats::lm(zY ~ zX + I(zX^2), data = df, weights = w_for_model)
+  } else {
+    fit <- stats::lm(zY ~ zX, data = df, weights = w_for_model)
+  }
+
+  s <- summary(fit)
+  b <- stats::coef(fit)
+  b0 <- unname(b[1])
+  b1 <- if ("zX" %in% names(b)) unname(b["zX"]) else NA_real_
+  b2 <- if ("I(zX^2)" %in% names(b)) unname(b["I(zX^2)"]) else NA_real_
+  p1 <- tryCatch(as.numeric(s$coefficients["zX", 4]), error = function(e) NA_real_)
+  p2 <- tryCatch(as.numeric(s$coefficients["I(zX^2)", 4]), error = function(e) NA_real_)
+  r2 <- weighted_R2(df$zY, stats::fitted(fit), df$w_for_model, clamp_zero = TRUE)
+  list(fit = fit, model_form = model_form, b0 = b0, b1 = b1, b2 = b2,
+       p_linear = p1, p_quadratic = p2, R2 = r2, AIC = stats::AIC(fit), error = "")
+}
+
+model_row_from_result <- function(res, dat, target_row, cmp, metric, dataset_tag) {
+  tibble::tibble(
+    AnalysisOrder = target_row$AnalysisOrder,
+    Metric = metric,
+    ComparisonType = cmp,
+    AnalysisID = target_row$AnalysisID,
+    TargetType = target_row$TargetType,
+    PlotLabel = plot_file_label(cmp, target_row$XTrait, target_row$YLabel, metric),
+    XTrait = target_row$XTrait,
+    YLabel = target_row$YLabel,
+    YTargetTrait = target_row$YTrait,
+    Dataset = dataset_tag,
+    Method = "WLS",
+    ModelForm = res$model_form,
+    n_rows = nrow(dat),
+    n_studies = dplyr::n_distinct(dat$StudyID),
+    n_systems = dplyr::n_distinct(dat$SystemID),
+    n_response_traits = dplyr::n_distinct(dat$YTrait),
+    response_traits = if (nrow(dat) > 0) paste(sort(unique(dat$YTrait)), collapse = "; ") else NA_character_,
+    Intercept = res$b0,
+    Slope_linear = res$b1,
+    Slope_quadratic = res$b2,
+    P_linear = res$p_linear,
+    P_quadratic = res$p_quadratic,
+    R2 = res$R2,
+    AIC = res$AIC,
+    Error = res$error
+  )
+}
+
+fit_candidate_models <- function(dat, target_row, cmp, metric, dataset_tag) {
+  out <- list()
+  for (mf in c("linear", "quadratic")) {
+    res <- tryCatch(
+      run_WLS_model(dat, mf),
+      error = function(e) list(fit = NULL, model_form = mf, b0 = NA_real_, b1 = NA_real_, b2 = NA_real_,
+                               p_linear = NA_real_, p_quadratic = NA_real_, R2 = NA_real_,
+                               AIC = NA_real_, error = e$message)
+    )
+    out[[mf]] <- list(result = res, summary = model_row_from_result(res, dat, target_row, cmp, metric, dataset_tag))
+  }
+  out
+}
+
+min_studies_required <- function(comparison_type) {
+  cmp <- std_text(comparison_type)
+  if (identical(cmp, "introduced_vs_native_range")) {
+    return(selection_min_studies_introduced_vs_native_range)
+  }
+  selection_min_studies_invasive_vs_native
+}
+
+selection_tier_label <- function(row, comparison_type) {
+  ## The minimum StudyID threshold is predefined separately for each comparison type.
+  ## If a model passes that prespecified threshold and the other criteria, it is treated
+  ## as a selected model without additional labels in output file names.
+  if (!is.finite(row$n_studies)) return("not_selected")
+  "selected"
+}
+
+passes_common_quality <- function(row, comparison_type, min_r2 = selection_min_r2) {
+  if (!is.na(row$Error) && nzchar(row$Error)) return(FALSE)
+  if (!is.finite(row$R2) || row$R2 < min_r2) return(FALSE)
+  if (!is.finite(row$n_rows) || row$n_rows < selection_min_n) return(FALSE)
+  if (!is.finite(row$n_studies) || row$n_studies < min_studies_required(comparison_type)) return(FALSE)
+  if (!is.finite(row$n_systems) || row$n_systems < selection_min_systems) return(FALSE)
+  TRUE
+}
+
+passes_model_term <- function(row, model_form, alpha_value) {
+  if (identical(model_form, "linear")) {
+    return(is.finite(row$P_linear) && row$P_linear <= alpha_value)
+  }
+  is.finite(row$P_quadratic) && row$P_quadratic <= alpha_value
+}
+
+make_selection_decision <- function(linear_row, quad_row, target_type, comparison_type) {
+  min_studies_now <- min_studies_required(comparison_type)
+
+  lin_ok <- passes_common_quality(linear_row, comparison_type, selection_min_r2) &&
+    passes_model_term(linear_row, "linear", selection_alpha)
+  quad_ok_base <- passes_common_quality(quad_row, comparison_type, selection_min_r2) &&
+    passes_model_term(quad_row, "quadratic", selection_alpha)
+
+  delta_aic <- if (is.finite(linear_row$AIC) && is.finite(quad_row$AIC)) linear_row$AIC - quad_row$AIC else NA_real_
+  delta_r2  <- if (is.finite(linear_row$R2) && is.finite(quad_row$R2)) quad_row$R2 - linear_row$R2 else NA_real_
+
+  quad_clearly_better <- quad_ok_base &&
+    is.finite(delta_aic) && is.finite(delta_r2) &&
+    delta_aic >= selection_min_delta_aic_for_quadratic &&
+    delta_r2 >= selection_min_delta_r2_for_quadratic
+
+  is_structural_total <- identical(target_type, "structural_material_total")
+
+  status_if_selected <- selection_tier_label(quad_row, comparison_type)
+  status_if_selected_linear <- selection_tier_label(linear_row, comparison_type)
+
+  if (is_structural_total && isTRUE(prefer_quadratic_for_structural_total) && quad_ok_base) {
+    return(tibble::tibble(
+      SelectedModelForm = "quadratic",
+      SelectionStatus = status_if_selected,
+      SelectionReason = paste0("structural material total: quadratic passed quality criteria; ",
+                               "pooled multiple structural material traits; minimum StudyID for this comparison = ",
+                               min_studies_now),
+      LinearPass = lin_ok,
+      QuadraticPass = quad_ok_base,
+      DeltaAIC_linear_minus_quadratic = delta_aic,
+      DeltaR2_quadratic_minus_linear = delta_r2,
+      MinStudiesRequired = min_studies_now
+    ))
+  }
+
+  if (quad_clearly_better) {
+    return(tibble::tibble(
+      SelectedModelForm = "quadratic",
+      SelectionStatus = status_if_selected,
+      SelectionReason = paste0("quadratic selected: P_quadratic <= ", selection_alpha,
+                               ", R2 >= ", selection_min_r2,
+                               ", AIC improved by >= ", selection_min_delta_aic_for_quadratic,
+                               ", R2 improved by >= ", selection_min_delta_r2_for_quadratic,
+                               ", and StudyID >= ", min_studies_now),
+      LinearPass = lin_ok,
+      QuadraticPass = quad_ok_base,
+      DeltaAIC_linear_minus_quadratic = delta_aic,
+      DeltaR2_quadratic_minus_linear = delta_r2,
+      MinStudiesRequired = min_studies_now
+    ))
+  }
+
+  if (lin_ok) {
+    return(tibble::tibble(
+      SelectedModelForm = "linear",
+      SelectionStatus = status_if_selected_linear,
+      SelectionReason = paste0("linear selected by parsimony: linear passed quality criteria and quadratic was not clearly better; ",
+                               "minimum StudyID for this comparison = ", min_studies_now),
+      LinearPass = lin_ok,
+      QuadraticPass = quad_ok_base,
+      DeltaAIC_linear_minus_quadratic = delta_aic,
+      DeltaR2_quadratic_minus_linear = delta_r2,
+      MinStudiesRequired = min_studies_now
+    ))
+  }
+
+  if (quad_ok_base && !lin_ok) {
+    return(tibble::tibble(
+      SelectedModelForm = "quadratic",
+      SelectionStatus = status_if_selected,
+      SelectionReason = paste0("quadratic selected: linear did not pass, but quadratic term passed quality criteria; ",
+                               "minimum StudyID for this comparison = ", min_studies_now),
+      LinearPass = lin_ok,
+      QuadraticPass = quad_ok_base,
+      DeltaAIC_linear_minus_quadratic = delta_aic,
+      DeltaR2_quadratic_minus_linear = delta_r2,
+      MinStudiesRequired = min_studies_now
+    ))
+  }
+
+  ## Optional supplementary tier: less strict p/R2 thresholds, still with replication filters.
+  ## This allows the user to inspect borderline relationships without presenting them as
+  ## fully supported main results.
+  if (isTRUE(allow_supplementary_output)) {
+    lin_exp <- passes_common_quality(linear_row, comparison_type, selection_min_r2_supplementary) &&
+      passes_model_term(linear_row, "linear", selection_alpha_supplementary)
+    quad_exp <- passes_common_quality(quad_row, comparison_type, selection_min_r2_supplementary) &&
+      passes_model_term(quad_row, "quadratic", selection_alpha_supplementary)
+
+    if (quad_exp || lin_exp) {
+      choose_quad <- FALSE
+      if (quad_exp && lin_exp) {
+        choose_quad <- is.finite(delta_aic) && is.finite(delta_r2) &&
+          delta_aic >= selection_min_delta_aic_for_quadratic &&
+          delta_r2 >= selection_min_delta_r2_for_quadratic
+      } else if (quad_exp && !lin_exp) {
+        choose_quad <- TRUE
+      }
+
+      chosen_form <- if (choose_quad) "quadratic" else "linear"
+      return(tibble::tibble(
+        SelectedModelForm = chosen_form,
+        SelectionStatus = "selected_supplementary",
+        SelectionReason = paste0("supplementary selected: secondary criteria met (P <= ",
+                                 selection_alpha_supplementary, ", R2 >= ",
+                                 selection_min_r2_supplementary, ", StudyID >= ",
+                                 min_studies_now, "); reported as supplementary evidence"),
+        LinearPass = lin_exp,
+        QuadraticPass = quad_exp,
+        DeltaAIC_linear_minus_quadratic = delta_aic,
+        DeltaR2_quadratic_minus_linear = delta_r2,
+        MinStudiesRequired = min_studies_now
+      ))
+    }
+  }
+
+  ## Explain the first major reason for rejection so the user can audit results.
+  fail_parts <- c()
+  if (linear_row$n_rows < selection_min_n || quad_row$n_rows < selection_min_n) fail_parts <- c(fail_parts, paste0("n < ", selection_min_n))
+  if (linear_row$n_studies < min_studies_now || quad_row$n_studies < min_studies_now) fail_parts <- c(fail_parts, paste0("StudyID < ", min_studies_now))
+  if (linear_row$n_systems < selection_min_systems || quad_row$n_systems < selection_min_systems) fail_parts <- c(fail_parts, paste0("SystemID < ", selection_min_systems))
+  if ((is.finite(linear_row$R2) && linear_row$R2 < selection_min_r2) && (is.finite(quad_row$R2) && quad_row$R2 < selection_min_r2)) fail_parts <- c(fail_parts, paste0("R2 < ", selection_min_r2))
+  if (!(is.finite(linear_row$P_linear) && linear_row$P_linear <= selection_alpha) && !(is.finite(quad_row$P_quadratic) && quad_row$P_quadratic <= selection_alpha)) fail_parts <- c(fail_parts, paste0("no significant linear/quadratic term at alpha = ", selection_alpha))
+  if (length(fail_parts) == 0) fail_parts <- "did not pass predefined model-selection criteria"
+
+  tibble::tibble(
+    SelectedModelForm = NA_character_,
+    SelectionStatus = "not_selected",
+    SelectionReason = paste(unique(fail_parts), collapse = "; "),
+    LinearPass = lin_ok,
+    QuadraticPass = quad_ok_base,
+    DeltaAIC_linear_minus_quadratic = delta_aic,
+    DeltaR2_quadratic_minus_linear = delta_r2,
+    MinStudiesRequired = min_studies_now
+  )
+}
+
+make_prediction_band <- function(fit, df) {
+  xg <- make_xgrid(df$zX, n = 240)
+  newdat <- data.frame(zX = xg)
+  pr <- stats::predict(fit, newdata = newdat, se.fit = TRUE)
+  tval <- stats::qt(0.975, df = max(1, fit$df.residual))
+  data.frame(
+    x = xg,
+    fit = as.numeric(pr$fit),
+    lwr = as.numeric(pr$fit - tval * pr$se.fit),
+    upr = as.numeric(pr$fit + tval * pr$se.fit)
+  )
+}
+
+build_plot <- function(df, model_res, comparison_type, target_row, dataset_tag, metric, model_form) {
+  if (nrow(df) < min_n_linear || !is.finite(model_res$R2)) return(NULL)
+  band <- make_prediction_band(model_res$fit, df)
+  if (nrow(band) == 0) return(NULL)
+
+  axis_labs <- get_axis_labels(comparison_type, target_row$XTrait, target_row$YLabel, metric)
+  r2_label <- paste0("R² = ", fmt_num(model_res$R2, 3))
+  df <- df %>% dplyr::mutate(
+    point_weight = w_for_model,
+    point_size = rescale_point_sizes(w_for_model, point_size_range)
+  )
+
+  xr <- range(df$zX, na.rm = TRUE)
+  if (!all(is.finite(xr)) || diff(xr) == 0) xr <- xr + c(-1, 1)
+  xpad <- 0.08 * diff(xr)
+  if (!is.finite(xpad) || xpad <= 0) xpad <- 0.15
+  xlim <- c(xr[1] - xpad, xr[2] + xpad)
+
+  band_finite <- band %>%
+    dplyr::filter(is.finite(x), is.finite(fit), is.finite(lwr), is.finite(upr)) %>%
+    dplyr::filter(x >= xlim[1], x <= xlim[2])
+
+  y_ref <- c(df$zY, band_finite$fit)
+  yr <- range(y_ref[is.finite(y_ref)], na.rm = TRUE)
+  if (!all(is.finite(yr)) || diff(yr) == 0) yr <- yr + c(-1, 1)
+  ypad <- 0.14 * diff(yr)
+  if (!is.finite(ypad) || ypad <= 0) ypad <- 0.15
+  ylim <- c(yr[1] - ypad, yr[2] + ypad)
+  ylim <- range(c(ylim, 0), na.rm = TRUE)
+  if (!all(is.finite(ylim)) || diff(ylim) == 0) ylim <- c(-1, 1)
+
+  band_plot <- band_finite
+  draw_ribbon <- FALSE
+  if (nrow(band_plot) >= min_ci_points_to_draw) {
+    observed_span <- diff(range(df$zY, na.rm = TRUE))
+    if (!is.finite(observed_span) || observed_span <= 0) observed_span <- diff(ylim)
+    if (!is.finite(observed_span) || observed_span <= 0) observed_span <- 1
+    band_plot <- band_plot %>% dplyr::mutate(ci_width = upr - lwr)
+    width_cap_1 <- ci_width_cap_multiplier * observed_span
+    width_cap_2 <- suppressWarnings(stats::quantile(band_plot$ci_width, probs = ci_trim_quantile, na.rm = TRUE))
+    width_cap <- min(width_cap_1, width_cap_2, na.rm = TRUE)
+    if (!is.finite(width_cap) || width_cap <= 0) width_cap <- width_cap_1
+    band_trimmed <- band_plot %>% dplyr::filter(ci_width <= width_cap)
+    if (nrow(band_trimmed) >= min_ci_points_to_draw) band_plot <- band_trimmed
+
+    band_plot <- band_plot %>%
+      dplyr::mutate(
+        lwr_plot = pmax(lwr, ylim[1]),
+        upr_plot = pmin(upr, ylim[2])
+      ) %>%
+      dplyr::filter(is.finite(lwr_plot), is.finite(upr_plot), upr_plot >= lwr_plot) %>%
+      dplyr::select(-ci_width)
+    draw_ribbon <- nrow(band_plot) >= min_ci_points_to_draw
+  }
+
+  line_plot <- band_finite %>% dplyr::mutate(fit_plot = fit) %>% dplyr::filter(is.finite(fit_plot))
+
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = zX, y = zY)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.45, color = "grey78") +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.45, color = "grey78")
+
+  if (draw_ribbon) {
+    p <- p + ggplot2::geom_ribbon(
+      data = band_plot,
+      ggplot2::aes(x = x, ymin = lwr_plot, ymax = upr_plot),
+      inherit.aes = FALSE, fill = "grey70", alpha = ribbon_alpha
+    )
+  }
+
+  p <- p +
+    ggplot2::geom_line(
+      data = line_plot,
+      ggplot2::aes(x = x, y = fit_plot), inherit.aes = FALSE,
+      color = "#2C6BD8", linewidth = 1.08, linetype = "dashed"
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(size = point_size), shape = 21,
+      fill = "grey45", color = "black", stroke = 0.22, alpha = 0.78
+    ) +
+    ggplot2::annotate(
+      "text", x = xlim[1] + 0.07 * diff(xlim), y = ylim[2] - 0.10 * diff(ylim),
+      label = r2_label, hjust = 0, vjust = 1, size = 5.0, fontface = "bold"
+    ) +
+    ggplot2::scale_size_identity(guide = "none") +
+    ggplot2::coord_cartesian(xlim = xlim, ylim = ylim, expand = FALSE, clip = "on") +
+    ggplot2::labs(x = axis_labs$x, y = axis_labs$y) +
+    ggplot2::theme_classic(base_size = base_font_size) +
+    ggplot2::theme(
+      text = ggplot2::element_text(color = "black"),
+      axis.title = ggplot2::element_text(face = "bold", size = base_font_size + 2),
+      axis.text = ggplot2::element_text(color = "black", size = base_font_size),
+      axis.line = ggplot2::element_line(linewidth = 0.8, color = "black"),
+      axis.ticks = ggplot2::element_line(linewidth = 0.8, color = "black"),
+      axis.ticks.length = grid::unit(0.18, "cm"),
+      plot.margin = ggplot2::margin(8, 10, 8, 10)
+    )
+  p
+}
+
+
+# =========================
+# 6b) Companion forest plots for selected relationships
+# =========================
+## Companion forest plots use LNRR for all selected relationships, including
+## introduced_vs_native_range relationships whose fitting scale is DIFF/Cha.
+## For transparency, each forest plot uses the same RowID set actually used in
+## the selected regression panel: unique nutrient rows from X_RowIDs plus unique
+## response rows from Y_RowID.
+
+parse_row_ids <- function(x) {
+  x <- as.character(x)
+  x <- x[!is.na(x) & nzchar(x)]
+  if (length(x) == 0) return(integer(0))
+  ids <- unlist(strsplit(x, ";", fixed = TRUE))
+  ids <- trimws(ids)
+  ids <- suppressWarnings(as.integer(ids))
+  ids[is.finite(ids)]
+}
+
+pool_lnrr_one_trait <- function(dat_trait) {
+  dat_trait <- dat_trait %>%
+    dplyr::filter(is.finite(lnRR_value), is.finite(Var_lnRR), Var_lnRR > 0)
+  k <- nrow(dat_trait)
+  if (k == 0) {
+    return(tibble::tibble(
+      Estimate = NA_real_, SE = NA_real_, CI_lower = NA_real_, CI_upper = NA_real_,
+      P_value = NA_real_, tau2 = NA_real_, I2 = NA_real_, k = 0,
+      n_studies = 0, n_systems = 0, Model = "no_valid_LNRR"
+    ))
+  }
+  if (k == 1) {
+    est <- dat_trait$lnRR_value[1]
+    se <- sqrt(dat_trait$Var_lnRR[1])
+    return(tibble::tibble(
+      Estimate = est, SE = se,
+      CI_lower = est - 1.96 * se,
+      CI_upper = est + 1.96 * se,
+      P_value = 2 * stats::pnorm(-abs(est / se)),
+      tau2 = NA_real_, I2 = NA_real_, k = k,
+      n_studies = dplyr::n_distinct(dat_trait$StudyID),
+      n_systems = dplyr::n_distinct(dat_trait$SystemID),
+      Model = "single_effect"
+    ))
+  }
+
+  res <- tryCatch(
+    metafor::rma.uni(yi = lnRR_value, vi = Var_lnRR, data = dat_trait, method = "REML"),
+    error = function(e) NULL
+  )
+  if (!is.null(res)) {
+    return(tibble::tibble(
+      Estimate = as.numeric(res$b[1]),
+      SE = as.numeric(res$se[1]),
+      CI_lower = as.numeric(res$ci.lb[1]),
+      CI_upper = as.numeric(res$ci.ub[1]),
+      P_value = as.numeric(res$pval[1]),
+      tau2 = as.numeric(res$tau2),
+      I2 = as.numeric(res$I2),
+      k = k,
+      n_studies = dplyr::n_distinct(dat_trait$StudyID),
+      n_systems = dplyr::n_distinct(dat_trait$SystemID),
+      Model = "REML_random_effects"
+    ))
+  }
+
+  ## Fallback fixed-effect inverse-variance estimate if REML fails.
+  w <- 1 / pmax(dat_trait$Var_lnRR, eps)
+  est <- sum(w * dat_trait$lnRR_value, na.rm = TRUE) / sum(w, na.rm = TRUE)
+  se <- sqrt(1 / sum(w, na.rm = TRUE))
+  tibble::tibble(
+    Estimate = est, SE = se,
+    CI_lower = est - 1.96 * se,
+    CI_upper = est + 1.96 * se,
+    P_value = 2 * stats::pnorm(-abs(est / se)),
+    tau2 = NA_real_, I2 = NA_real_, k = k,
+    n_studies = dplyr::n_distinct(dat_trait$StudyID),
+    n_systems = dplyr::n_distinct(dat_trait$SystemID),
+    Model = "fixed_effect_fallback"
+  )
+}
+
+make_companion_forest <- function(reg_dat, target_row, comparison_type, dataset_tag, metric) {
+  if (nrow(reg_dat) == 0) return(NULL)
+
+  x_ids <- parse_row_ids(reg_dat$X_RowIDs)
+  y_ids <- suppressWarnings(as.integer(reg_dat$Y_RowID))
+  y_ids <- y_ids[is.finite(y_ids)]
+  ids <- unique(c(x_ids, y_ids))
+  if (length(ids) == 0) return(NULL)
+
+  forest_rows <- raw_clean %>%
+    dplyr::filter(RowID %in% ids, valid_lnrr) %>%
+    dplyr::mutate(
+      Trait = std_trait(Trait),
+      ForestRole = dplyr::if_else(Trait == target_row$XTrait, "nutrient", "defense")
+    )
+
+  if (nrow(forest_rows) == 0) return(NULL)
+
+  wanted_traits <- unique(c(target_row$XTrait, reg_dat$YTrait))
+  forest_rows <- forest_rows %>% dplyr::filter(Trait %in% wanted_traits)
+  if (nrow(forest_rows) == 0) return(NULL)
+
+  forest_summary <- forest_rows %>%
+    dplyr::group_by(Trait) %>%
+    dplyr::group_modify(~ pool_lnrr_one_trait(.x)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      ComparisonType = comparison_type,
+      Dataset = dataset_tag,
+      MetricUsedForForest = "LNRR",
+      AnalysisOrder = target_row$AnalysisOrder,
+      AnalysisID = target_row$AnalysisID,
+      XTrait = target_row$XTrait,
+      YLabel = target_row$YLabel,
+      YTargetTrait = target_row$YTrait,
+      Role = dplyr::if_else(Trait == target_row$XTrait, "nutrient", "defense")
+    ) %>%
+    dplyr::filter(is.finite(Estimate), is.finite(CI_lower), is.finite(CI_upper))
+
+  if (nrow(forest_summary) == 0) return(NULL)
+
+  trait_order <- c(target_row$XTrait, sort(setdiff(unique(forest_summary$Trait), target_row$XTrait)))
+  trait_n <- forest_summary$k[match(trait_order, as.character(forest_summary$Trait))]
+  trait_levels <- rev(paste0(trait_order, "
+(n=", trait_n, ")"))
+
+  forest_summary <- forest_summary %>%
+    dplyr::mutate(
+      n = k,
+      SignifStar = dplyr::case_when(
+        is.finite(P_value) & P_value < 0.001 ~ "***",
+        is.finite(P_value) & P_value < 0.01  ~ "**",
+        is.finite(P_value) & P_value < 0.05  ~ "*",
+        TRUE ~ ""
+      ),
+      Trait = factor(Trait, levels = rev(trait_order)),
+      TraitLabel = paste0(as.character(Trait), "
+(n=", n, ")"),
+      TraitLabel = factor(TraitLabel, levels = trait_levels)
+    )
+
+  ## Display range for the companion forest plot.
+  ## Full estimates and 95% CIs are shown. No horizontal CI clipping is applied.
+  ## A small right-side star zone is added so significance stars do not overlap CI bars.
+  xvals <- c(forest_summary$CI_lower, forest_summary$CI_upper, forest_summary$Estimate, 0)
+  xr <- range(xvals[is.finite(xvals)], na.rm = TRUE)
+  if (!all(is.finite(xr)) || diff(xr) == 0) xr <- c(-1, 1)
+  xspan <- diff(xr)
+  if (!is.finite(xspan) || xspan <= 0) xspan <- 1
+  xpad_left  <- 0.16 * xspan
+  xpad_right <- 0.34 * xspan
+  xlim <- c(xr[1] - xpad_left, xr[2] + xpad_right)
+  star_x <- xr[2] + 0.16 * xspan
+
+  forest_summary <- forest_summary %>%
+    dplyr::mutate(
+      CI_lower_plot = CI_lower,
+      CI_upper_plot = CI_upper,
+      cap_h = 0.045,
+      y_num = as.numeric(TraitLabel),
+      StarX = star_x
+    )
+
+  p <- ggplot2::ggplot(forest_summary, ggplot2::aes(y = TraitLabel, x = Estimate)) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.50, color = "grey72") +
+    ggplot2::geom_segment(ggplot2::aes(x = CI_lower_plot, xend = CI_upper_plot, yend = TraitLabel),
+                          linewidth = 0.78, color = "black") +
+    ggplot2::geom_segment(ggplot2::aes(x = CI_lower_plot, xend = CI_lower_plot,
+                                       y = y_num - cap_h, yend = y_num + cap_h),
+                          inherit.aes = FALSE, linewidth = 0.78, color = "black") +
+    ggplot2::geom_segment(ggplot2::aes(x = CI_upper_plot, xend = CI_upper_plot,
+                                       y = y_num - cap_h, yend = y_num + cap_h),
+                          inherit.aes = FALSE, linewidth = 0.78, color = "black") +
+    ggplot2::geom_point(shape = 21, size = 2.8, stroke = 0.35, fill = "grey45", color = "black") +
+    ggplot2::geom_text(ggplot2::aes(x = StarX, label = SignifStar),
+                       color = "#D7191C", fontface = "bold", size = 4.8, hjust = 0.5, vjust = 0.45) +
+    ggplot2::scale_x_continuous(breaks = scales::pretty_breaks(n = 3), labels = scales::label_number(accuracy = 0.01), guide = ggplot2::guide_axis(check.overlap = TRUE)) +
+    ggplot2::coord_cartesian(xlim = xlim, clip = "on") +
+    ggplot2::labs(x = "lnRR", y = NULL) +
+    ggplot2::theme_classic(base_size = base_font_size) +
+    ggplot2::theme(
+      text = ggplot2::element_text(color = "black"),
+      axis.title.x = ggplot2::element_text(face = "bold", size = base_font_size + 1),
+      axis.text.x = ggplot2::element_text(color = "black", size = base_font_size - 1),
+      axis.text.y = ggplot2::element_text(color = "black", size = base_font_size - 3, face = "bold", lineheight = 0.82),
+      axis.line = ggplot2::element_line(linewidth = 0.8, color = "black"),
+      axis.ticks = ggplot2::element_line(linewidth = 0.8, color = "black"),
+      axis.ticks.length = grid::unit(0.14, "cm"),
+      plot.margin = ggplot2::margin(8, 2, 8, 4)
+    )
+
+  list(plot = p, summary = forest_summary, n_forest_rows = nrow(forest_summary))
+}
+
+make_combined_panel <- function(forest_plot, regression_plot) {
+  if (is.null(regression_plot)) return(NULL)
+  if (is.null(forest_plot)) return(regression_plot)
+  forest_plot + regression_plot + patchwork::plot_layout(widths = c(0.95, 2.50))
+}
+
+
+make_funnel_title <- function(metric, target_row, forest_trait) {
+  prefix <- if (identical(metric, "DIFF")) "Cha" else "LNRR"
+  paste0(prefix, " ", target_row$XTrait, " VS. ", target_row$YLabel, "-", forest_trait)
+}
+
+make_funnel_data_one_trait <- function(reg_dat, target_row, forest_trait, metric) {
+  x_ids <- parse_row_ids(reg_dat$X_RowIDs)
+  y_ids <- suppressWarnings(as.integer(reg_dat$Y_RowID))
+  y_ids <- y_ids[is.finite(y_ids)]
+  ids <- unique(c(x_ids, y_ids))
+  if (length(ids) == 0) return(NULL)
+
+  fdat <- raw_clean %>%
+    dplyr::filter(RowID %in% ids, valid_lnrr) %>%
+    dplyr::mutate(
+      Trait = std_trait(Trait),
+      SE_lnRR = sqrt(Var_lnRR)
+    ) %>%
+    dplyr::filter(Trait == forest_trait,
+                  is.finite(lnRR_value), is.finite(Var_lnRR), Var_lnRR > 0,
+                  is.finite(SE_lnRR), SE_lnRR > 0)
+
+  if (nrow(fdat) < 3) return(NULL)
+
+  model_obj <- tryCatch(
+    metafor::rma.uni(yi = lnRR_value, vi = Var_lnRR, data = fdat, method = "REML"),
+    error = function(e) NULL
+  )
+  if (is.null(model_obj)) {
+    model_obj <- tryCatch(
+      metafor::rma.uni(yi = lnRR_value, vi = Var_lnRR, data = fdat, method = "FE"),
+      error = function(e) NULL
+    )
+  }
+  if (is.null(model_obj)) return(NULL)
+
+  pooled <- pool_lnrr_one_trait(fdat)
+
+  egger_p <- NA_real_
+  begg_p <- NA_real_
+  trimfill_k0 <- NA_real_
+
+  if (nrow(fdat) >= min_effects_for_bias_tests) {
+    egger_p <- tryCatch(as.numeric(metafor::regtest(model_obj, model = "rma")$pval), error = function(e) NA_real_)
+    if (isTRUE(run_begg_ranktest)) {
+      begg_p <- tryCatch(as.numeric(metafor::ranktest(model_obj)$pval), error = function(e) NA_real_)
+    }
+    if (isTRUE(run_trimfill_for_funnel)) {
+      tf <- tryCatch(metafor::trimfill(model_obj), error = function(e) NULL)
+      if (!is.null(tf)) trimfill_k0 <- suppressWarnings(as.numeric(tf$k0))
+    }
+  }
+
+  list(
+    data = fdat,
+    model = model_obj,
+    pooled = pooled,
+    title = make_funnel_title(metric, target_row, forest_trait),
+    egger_p = egger_p,
+    begg_p = begg_p,
+    trimfill_k0 = trimfill_k0,
+    n_effect_sizes = nrow(fdat),
+    k_studies = dplyr::n_distinct(fdat$StudyID)
+  )
+}
+
+draw_funnel_base <- function(funnel_obj) {
+  metafor::funnel(
+    funnel_obj$model,
+    refline = 0,
+    level = funnel_level,
+    shade = funnel_shade,
+    xlab = "lnRR",
+    ylab = "Standard Error",
+    cex = 0.85
+  )
+  title(main = funnel_obj$title, cex.main = 1.05, font.main = 2)
+
+  if (isTRUE(show_funnel_contour_legend)) {
+    legend(
+      x = "topleft",
+      cex = 0.75,
+      legend = c("0.1 > p > 0.05", "0.05 > p > 0.01", "p < 0.01"),
+      fill = funnel_shade,
+      bty = "n"
+    )
+  }
+
+  usr <- par("usr")
+  info_txt <- paste0("Egger P = ", fmt_p(funnel_obj$egger_p))
+  if (isTRUE(run_begg_ranktest)) {
+    info_txt <- paste0(info_txt, "
+Begg P = ", fmt_p(funnel_obj$begg_p))
+  }
+  if (!is.na(funnel_obj$trimfill_k0) && is.finite(funnel_obj$trimfill_k0)) {
+    info_txt <- paste0(info_txt, "
+Trim-and-fill k0 = ", funnel_obj$trimfill_k0)
+  }
+  if (isTRUE(show_funnel_nk_on_plot)) {
+    info_txt <- paste0(info_txt, "
+n = ", funnel_obj$n_effect_sizes, ", k = ", funnel_obj$k_studies)
+  }
+
+  text(
+    x = usr[2] - 0.02 * (usr[2] - usr[1]),
+    y = usr[4] - 0.05 * (usr[4] - usr[3]),
+    labels = info_txt,
+    adj = c(1, 1),
+    cex = 0.78
+  )
+}
+
+save_funnel_pdf_base <- function(funnel_obj, out_pdf) {
+  grDevices::pdf(out_pdf, width = funnel_pdf_w, height = funnel_pdf_h)
+  op <- par(mar = c(4.4, 4.4, 2.4, 1.2))
+  draw_funnel_base(funnel_obj)
+  par(op)
+  grDevices::dev.off()
+}
+
+# =========================
+# 7) Main loop: fit linear + quadratic, select usable model, output selected PDFs only
+# =========================
+all_prepared <- list()
+all_candidate_summaries <- list()
+all_selection_rows <- list()
+all_selected_summaries <- list()
+all_diagnostics <- list()
+all_weight_diagnostics <- list()
+all_forest_summaries <- list()
+all_funnel_summaries <- list()
+
+for (cmp in comparison_to_run) {
+  metric <- selected_metric_for_comparison(cmp)
+  analysis_base <- make_analysis_base(cmp, metric)
+  all_diagnostics[[cmp]] <- make_diagnostics(analysis_base)
+
+  for (ii in seq_len(nrow(analysis_targets))) {
+    target_row <- analysis_targets[ii, ]
+    dat_raw <- build_fit_data(analysis_base, target_row, cmp, metric)
+    dat_list <- list(RAW = dat_raw)
+    if (isTRUE(run_iqr_sensitivity)) dat_list$IQR_removed <- iqr_filter_2d(dat_raw, "zX", "zY", iqr_k)
+
+    for (dataset_tag in names(dat_list)) {
+      dat <- dat_list[[dataset_tag]]
+      dat$dataset <- dataset_tag
+      key <- paste(metric, cmp, target_row$AnalysisID, dataset_tag, sep = "__")
+      all_prepared[[key]] <- dat
+
+      if (nrow(dat) > 0) {
+        all_weight_diagnostics[[key]] <- dat %>%
+          dplyr::summarise(
+            Metric = dplyr::first(metric), ComparisonType = dplyr::first(ComparisonType),
+            AnalysisOrder = dplyr::first(AnalysisOrder), AnalysisID = dplyr::first(AnalysisID),
+            Dataset = dplyr::first(dataset), XTrait = dplyr::first(x_trait), YLabel = dplyr::first(y_label),
+            n_rows = dplyr::n(), n_studies = dplyr::n_distinct(StudyID), n_systems = dplyr::n_distinct(SystemID),
+            n_response_traits = dplyr::n_distinct(YTrait),
+            weight_min = min(w_for_model, na.rm = TRUE),
+            weight_median = stats::median(w_for_model, na.rm = TRUE),
+            weight_mean = mean(w_for_model, na.rm = TRUE),
+            weight_max = max(w_for_model, na.rm = TRUE),
+            weight_max_over_median = max(w_for_model, na.rm = TRUE) / stats::median(w_for_model, na.rm = TRUE),
+            top_weight_study = StudyID[which.max(w_for_model)],
+            top_weight_system = SystemID[which.max(w_for_model)],
+            top_weight_trait = YTrait[which.max(w_for_model)],
+            .groups = "drop"
+          )
+      }
+
+      cand <- fit_candidate_models(dat, target_row, cmp, metric, dataset_tag)
+      cand_summary <- dplyr::bind_rows(cand$linear$summary, cand$quadratic$summary)
+      all_candidate_summaries[[key]] <- cand_summary
+
+      lin_row <- cand$linear$summary[1, ]
+      quad_row <- cand$quadratic$summary[1, ]
+      decision <- make_selection_decision(lin_row, quad_row, target_row$TargetType, cmp) %>%
+        dplyr::mutate(
+          AnalysisOrder = target_row$AnalysisOrder,
+          Metric = metric,
+          ComparisonType = cmp,
+          AnalysisID = target_row$AnalysisID,
+          TargetType = target_row$TargetType,
+          PlotLabel = plot_file_label(cmp, target_row$XTrait, target_row$YLabel, metric),
+          XTrait = target_row$XTrait,
+          YLabel = target_row$YLabel,
+          YTargetTrait = target_row$YTrait,
+          Dataset = dataset_tag,
+          n_rows = nrow(dat),
+          n_studies = dplyr::n_distinct(dat$StudyID),
+          n_systems = dplyr::n_distinct(dat$SystemID),
+          n_response_traits = dplyr::n_distinct(dat$YTrait),
+          response_traits = if (nrow(dat) > 0) paste(sort(unique(dat$YTrait)), collapse = "; ") else NA_character_
+        )
+
+      selected_pdf <- NA_character_
+      selected_forest_pdf <- NA_character_
+      selected_combined_pdf <- NA_character_
+      selected_funnel_pdfs <- NA_character_
+      if (decision$SelectionStatus %in% c("selected", "selected_supplementary")) {
+        sel_form <- decision$SelectedModelForm
+        model_res <- cand[[sel_form]]$result
+        plot_obj <- build_plot(dat, model_res, cmp, target_row, dataset_tag, metric, sel_form)
+        if (!is.null(plot_obj)) {
+          file_label <- plot_file_label(cmp, target_row$XTrait, target_row$YLabel, metric)
+          ## Review version: do not export standalone regression or forest PDFs.
+          ## Only the combined forest+regression panel and the corresponding funnel plots are exported.
+          selected_pdf <- NA_character_
+          selected_forest_pdf <- NA_character_
+
+          forest_obj <- make_companion_forest(dat, target_row, cmp, dataset_tag, metric)
+          if (!is.null(forest_obj) && !is.null(forest_obj$plot)) {
+            file_metric <- output_metric_label(cmp, metric)
+            selected_combined_pdf <- paste0(file_metric, "_WLS_", sel_form, "_", dataset_tag, "_", file_label, "_combined.pdf")
+            combo_obj <- make_combined_panel(forest_obj$plot, plot_obj)
+            ggplot2::ggsave(filename = file.path(out_dir, selected_combined_pdf), plot = combo_obj,
+                            width = combined_pdf_w, height = combined_pdf_h, device = "pdf")
+            all_forest_summaries[[key]] <- forest_obj$summary %>%
+              dplyr::mutate(
+                SelectedModelForm = sel_form,
+                SelectedRegressionPdfFile = NA_character_,
+                SelectedForestPdfFile = NA_character_,
+                SelectedCombinedPdfFile = selected_combined_pdf
+              )
+
+            ## Funnel plots for every trait shown in the companion forest plot.
+            funnel_files <- character(0)
+            forest_traits <- as.character(forest_obj$summary$Trait)
+            forest_traits <- unique(forest_traits[!is.na(forest_traits) & nzchar(forest_traits)])
+            for (ft in forest_traits) {
+              funnel_obj <- make_funnel_data_one_trait(dat, target_row, ft, metric)
+              if (!is.null(funnel_obj)) {
+                file_metric <- output_metric_label(cmp, metric)
+                funnel_file <- paste0(file_metric, "_WLS_", sel_form, "_", dataset_tag, "_",
+                                      file_label, "_funnel_", safe_file_label(ft), ".pdf")
+                save_funnel_pdf_base(funnel_obj, file.path(out_dir, funnel_file))
+                funnel_files <- c(funnel_files, funnel_file)
+                all_funnel_summaries[[paste(key, ft, sep = "__")]] <- funnel_obj$pooled %>%
+                  dplyr::mutate(
+                    ComparisonType = cmp,
+                    Dataset = dataset_tag,
+                    MetricUsedForFunnel = "LNRR",
+                    AnalysisOrder = target_row$AnalysisOrder,
+                    AnalysisID = target_row$AnalysisID,
+                    XTrait = target_row$XTrait,
+                    YLabel = target_row$YLabel,
+                    FunnelTrait = ft,
+                    FunnelTitle = funnel_obj$title,
+                    SelectedModelForm = sel_form,
+                    SelectedRegressionPdfFile = selected_pdf,
+                    SelectedForestPdfFile = selected_forest_pdf,
+                    SelectedCombinedPdfFile = selected_combined_pdf,
+                    SelectedFunnelPdfFile = funnel_file
+                  )
+              }
+            }
+            if (length(funnel_files) > 0) {
+              selected_funnel_pdfs <- paste(funnel_files, collapse = ";")
+            }
+          }
+        } else {
+          decision$SelectionStatus <- "not_selected"
+          decision$SelectionReason <- paste(decision$SelectionReason, "; plot object not generated")
+        }
+      }
+      decision$SelectedPdfFile <- selected_pdf
+      decision$SelectedForestPdfFile <- selected_forest_pdf
+      decision$SelectedCombinedPdfFile <- selected_combined_pdf
+      decision$SelectedFunnelPdfFiles <- selected_funnel_pdfs
+      all_selection_rows[[key]] <- decision
+
+      if (decision$SelectionStatus %in% c("selected", "selected_supplementary")) {
+        sel_sum <- cand[[decision$SelectedModelForm]]$summary %>%
+          dplyr::mutate(
+            SelectionStatus = decision$SelectionStatus,
+            SelectionReason = decision$SelectionReason,
+            SelectedPdfFile = selected_pdf,
+            SelectedForestPdfFile = selected_forest_pdf,
+            SelectedCombinedPdfFile = selected_combined_pdf,
+            SelectedFunnelPdfFiles = selected_funnel_pdfs,
+            DeltaAIC_linear_minus_quadratic = decision$DeltaAIC_linear_minus_quadratic,
+            DeltaR2_quadratic_minus_linear = decision$DeltaR2_quadratic_minus_linear
+          )
+        all_selected_summaries[[key]] <- sel_sum
+      }
+    }
+  }
+}
+
+prepared_df <- dplyr::bind_rows(all_prepared)
+candidate_summary_df <- dplyr::bind_rows(all_candidate_summaries) %>%
+  dplyr::arrange(AnalysisOrder, XTrait, YLabel, ComparisonType, Dataset, ModelForm)
+selection_df <- dplyr::bind_rows(all_selection_rows) %>%
+  dplyr::arrange(AnalysisOrder, XTrait, YLabel, ComparisonType, Dataset)
+selected_summary_df <- dplyr::bind_rows(all_selected_summaries) %>%
+  dplyr::arrange(AnalysisOrder, XTrait, YLabel, ComparisonType, Dataset)
+
+forest_summary_df <- dplyr::bind_rows(all_forest_summaries) %>%
+  dplyr::arrange(AnalysisOrder, XTrait, YLabel, ComparisonType, Dataset, Role, Trait)
+
+funnel_summary_df <- dplyr::bind_rows(all_funnel_summaries) %>%
+  dplyr::arrange(AnalysisOrder, XTrait, YLabel, ComparisonType, Dataset, FunnelTrait)
+
+expected_pdf_check <- selection_df %>%
+  dplyr::mutate(
+    PdfExpected = FALSE,
+    PdfCreated = NA,
+    ForestPdfExpected = FALSE,
+    ForestPdfCreated = NA,
+    CombinedPdfExpected = SelectionStatus %in% c("selected", "selected_supplementary"),
+    CombinedPdfCreated = !is.na(SelectedCombinedPdfFile) & file.exists(file.path(out_dir, SelectedCombinedPdfFile)),
+    FunnelPdfExpected = CombinedPdfExpected,
+    FunnelPdfCount = purrr::map_int(strsplit(dplyr::coalesce(SelectedFunnelPdfFiles, ""), ";", fixed = TRUE),
+                                    ~ sum(nzchar(.x))),
+    FunnelPdfCreatedCount = purrr::map_int(strsplit(dplyr::coalesce(SelectedFunnelPdfFiles, ""), ";", fixed = TRUE),
+                                           ~ sum(nzchar(.x) & file.exists(file.path(out_dir, .x)))),
+    FunnelPdfCreated = FunnelPdfCount > 0 & FunnelPdfCreatedCount == FunnelPdfCount,
+    MissingOrSkippedReason = dplyr::case_when(
+      CombinedPdfCreated & FunnelPdfCreated ~ "combined_panel_and_funnels_created",
+      CombinedPdfCreated & !FunnelPdfCreated ~ "combined_panel_created; one or more funnel plots not created",
+      !SelectionStatus %in% c("selected", "selected_supplementary") ~ SelectionReason,
+      is.na(SelectedCombinedPdfFile) ~ "selected but combined panel was not generated",
+      !file.exists(file.path(out_dir, SelectedCombinedPdfFile)) ~ "SelectedCombinedPdfFile listed but file not found on disk",
+      TRUE ~ "unknown"
+    )
+  )
+
+diagnostic_df <- dplyr::bind_rows(all_diagnostics, .id = "DiagnosticSet")
+weight_diag_df <- dplyr::bind_rows(all_weight_diagnostics) %>%
+  dplyr::arrange(AnalysisOrder, ComparisonType, Dataset)
+
+trait_availability <- raw_clean %>%
+  dplyr::filter(
+    UseForRegression %in% std_text(use_for_regression_keep),
+    PairingLevel %in% std_text(pairing_level_keep),
+    DataLevel %in% std_text(data_level_keep),
+    if (length(tissue_keep) > 0) Tissue %in% std_text(tissue_keep) else TRUE
+  ) %>%
+  dplyr::group_by(ComparisonType, Trait, TraitCategory, TraitForm) %>%
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    n_studies = dplyr::n_distinct(StudyID),
+    n_systems = dplyr::n_distinct(SystemID),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(ComparisonType, TraitCategory, Trait)
+
+dropped_list <- list()
+for (metric in c("LNRR")) {
+  valid_col <- if (metric == "LNRR") "valid_lnrr" else "valid_diff"
+  dropped_list[[metric]] <- raw_clean %>%
+    dplyr::mutate(
+      Metric = metric,
+      SelectedComparison = ComparisonType %in% std_text(comparison_to_run),
+      SelectedUse = UseForRegression %in% std_text(use_for_regression_keep),
+      SelectedPairing = PairingLevel %in% std_text(pairing_level_keep),
+      SelectedDataLevel = DataLevel %in% std_text(data_level_keep),
+      SelectedTissue = ifelse(length(tissue_keep) == 0, TRUE, Tissue %in% std_text(tissue_keep)),
+      DropReason = dplyr::case_when(
+        !.data[[valid_col]] ~ paste0("invalid_or_missing_numeric_values_for_", metric),
+        !SelectedComparison ~ "ComparisonType_not_selected",
+        !SelectedUse ~ "UseForRegression_not_selected",
+        !SelectedPairing ~ "PairingLevel_not_selected",
+        !SelectedDataLevel ~ "DataLevel_not_selected",
+        !SelectedTissue ~ "Tissue_not_selected",
+        TRUE ~ "kept_in_base_filter_but_may_not_match_nutrient_defense"
+      )
+    ) %>%
+    dplyr::filter(DropReason != "kept_in_base_filter_but_may_not_match_nutrient_defense")
+}
+dropped_df <- dplyr::bind_rows(dropped_list)
+
+settings_df <- tibble::tibble(
+  Item = c("input_file", "sheet_name", "comparison_to_run", "candidate_models", "selection_alpha",
+           "selection_min_r2", "selection_min_n", "selection_min_studies_invasive_vs_native", "selection_min_studies_introduced_vs_native_range", "selection_min_systems",
+           "selection_min_delta_aic_for_quadratic", "selection_min_delta_r2_for_quadratic", "allow_supplementary_output", "selection_alpha_supplementary", "selection_min_r2_supplementary",
+           "prefer_quadratic_for_structural_total", "use_for_regression_keep", "pairing_level_keep",
+           "data_level_keep", "tissue_keep", "force_lignin_to_physical", "diff_standardization_mode",
+           "standardize_lnrr", "run_iqr_sensitivity", "iqr_k", "cap_wls_weights", "weight_cap_quantile",
+           "structural_material_traits", "c_specific_defense_traits", "n_specific_chemical_traits",
+           "main_note", "figure_note"),
+  Value = c(infile, as.character(sheet_name), paste(comparison_to_run, collapse = ";"),
+            "WLS linear and WLS quadratic are both fitted for every target; one model is selected by predefined criteria, or no PDF is produced.",
+            as.character(selection_alpha), as.character(selection_min_r2), as.character(selection_min_n),
+            as.character(selection_min_studies_invasive_vs_native), as.character(selection_min_studies_introduced_vs_native_range), as.character(selection_min_systems),
+            as.character(selection_min_delta_aic_for_quadratic), as.character(selection_min_delta_r2_for_quadratic), as.character(allow_supplementary_output), as.character(selection_alpha_supplementary), as.character(selection_min_r2_supplementary),
+            as.character(prefer_quadratic_for_structural_total),
+            paste(use_for_regression_keep, collapse = ";"), paste(pairing_level_keep, collapse = ";"),
+            paste(data_level_keep, collapse = ";"), paste(tissue_keep, collapse = ";"),
+            as.character(force_lignin_to_physical), diff_standardization_mode, as.character(standardize_lnrr),
+            as.character(run_iqr_sensitivity), as.character(iqr_k), as.character(cap_wls_weights),
+            as.character(weight_cap_quantile), paste(structural_material_traits, collapse = ";"),
+            paste(c_specific_defense_traits, collapse = ";"), paste(n_specific_chemical_traits, collapse = ";"),
+            "Figure 3 module: element-matched and trait-specific raw lnRR WLS analyses for invasive_vs_native. Linear and quadratic models are fitted for every candidate relationship; the selected plot is exported only when the original predefined quality criteria are met.",
+            "Bubble size represents inverse-variance model weight. Panels show only R2. All selected fitted lines are blue dashed WLS fits. CI ribbons are visually trimmed/clipped only for plotting; model estimates and statistics are unchanged."
+  )
+)
+
+caption_file <- file.path(out_dir, "figure_caption_notes.txt")
+writeLines(c(
+  "Suggested figure caption notes:",
+  "Points represent trait-level nutrient-defense paired observations generated within the same SystemID.",
+  "Point size is proportional to the inverse-variance model weight.",
+  "Figure 3 panels use raw LNRR WLS fits for invasive plants relative to native plants.",
+  "For each candidate relationship, both linear and quadratic WLS models were fitted. A plot was exported only when a model met predefined criteria based on replication, R2, model term significance and, for quadratic models, improvement over the linear model.",
+  "Panels show only R2 values to reduce clutter; plot titles and subtitles are omitted intentionally.",
+  "RAW analyses are the main results; IQR_removed analyses are sensitivity analyses.",
+  "For each selected regression panel, a companion forest plot and a combined forest+regression panel are also generated. The companion forest always uses lnRR for the exact RowID set used in that selected regression relationship. Red asterisks in the forest panel indicate pooled lnRR significantly different from zero (* P < 0.05, ** P < 0.01, *** P < 0.001). The forest panel labels use n as the number of effect-size rows."
+), caption_file)
+
+out_xlsx <- file.path(out_dir, "Figure3_trait_specific_lnRR_RESULTS.xlsx")
+writexl::write_xlsx(
+  list(
+    Analysis_Targets = analysis_targets,
+    Prepared_Fit_Data = prepared_df,
+    Candidate_Model_Summary = candidate_summary_df,
+    Model_Selection_Summary = selection_df,
+    Selected_Model_Summary = selected_summary_df,
+    Selected_Forest_Summary = forest_summary_df,
+    Selected_Funnel_Summary = funnel_summary_df,
+    Expected_PDF_Checklist = expected_pdf_check,
+    Trait_Availability = trait_availability,
+    System_Trait_Coverage = diagnostic_df,
+    Weight_Diagnostics = weight_diag_df,
+    Dropped_Rows = dropped_df,
+    Settings = settings_df
+  ),
+  out_xlsx
+)
+
+message("Done. Output folder: ", out_dir)
+message("Results workbook: ", out_xlsx)
+message("Caption notes: ", caption_file)
+message("Combined forest+regression PDFs created: ", sum(expected_pdf_check$CombinedPdfCreated, na.rm = TRUE))
+message("Funnel PDFs created: ", sum(expected_pdf_check$FunnelPdfCreatedCount, na.rm = TRUE))
+message("Candidate relationships not selected: ", sum(!expected_pdf_check$SelectionStatus %in% c("selected", "selected_supplementary"), na.rm = TRUE))
+})
+
+
+# =========================
+# 4) Integration-level checks and index
+# =========================
+f2_dir <- file.path(combined_out_dir, "Figure2_broad_lnRR")
+f3_dir <- file.path(combined_out_dir, "Figure3_trait_specific_lnRR")
+f2_result_file <- file.path(f2_dir, "Figure2_broad_lnRR_RESULTS.xlsx")
+f3_result_file <- file.path(f3_dir, "Figure3_trait_specific_lnRR_RESULTS.xlsx")
+
+if (!file.exists(f2_result_file)) {
+  stop("Integration self-check failed: Figure 2 result workbook was not created.")
+}
+if (!file.exists(f3_result_file)) {
+  stop("Integration self-check failed: Figure 3 result workbook was not created.")
+}
+
+f2_summary_check <- readxl::read_excel(
+  f2_result_file, sheet = "Model_Summary"
+)
+f3_selection_check <- readxl::read_excel(
+  f3_result_file, sheet = "Model_Selection_Summary"
+)
+
+f2_scope_ok <- nrow(f2_summary_check) == 8 &&
+  all(f2_summary_check$Metric == "LNRR") &&
+  all(f2_summary_check$ComparisonType == "invasive_vs_native") &&
+  all(f2_summary_check$Method == "WLS") &&
+  all(f2_summary_check$ModelForm == "quadratic") &&
+  setequal(unique(f2_summary_check$Dataset), c("RAW", "IQR_removed"))
+
+f3_scope_ok <- nrow(f3_selection_check) > 0 &&
+  all(f3_selection_check$Metric == "LNRR") &&
+  all(f3_selection_check$ComparisonType == "invasive_vs_native") &&
+  setequal(unique(f3_selection_check$Dataset), c("RAW", "IQR_removed"))
+
+if (!f2_scope_ok) {
+  stop("Integration self-check failed: Figure 2 output scope changed.")
+}
+if (!f3_scope_ok) {
+  stop("Integration self-check failed: Figure 3 output scope changed.")
+}
+
+integration_checks <- tibble::tibble(
+  Check = c(
+    "shared_input_path",
+    "F2_result_workbook_created",
+    "F3_result_workbook_created",
+    "F2_scope_LNRR_invasive_WLS_quadratic_RAW_IQR",
+    "F3_scope_LNRR_invasive_RAW_IQR",
+    "module_environment_isolation"
+  ),
+  Status = c("PASS", "PASS", "PASS", "PASS", "PASS", "PASS"),
+  Observed = c(
+    shared_input_file,
+    f2_result_file,
+    f3_result_file,
+    paste0("rows=", nrow(f2_summary_check)),
+    paste0("rows=", nrow(f3_selection_check)),
+    "Figure 2 and Figure 3 executed in separate local environments"
+  )
+)
+
+integration_index <- tibble::tibble(
+  Figure = c("Figure 2", "Figure 3"),
+  Comparison = c("invasive_vs_native", "invasive_vs_native"),
+  Metric = c("raw lnRR", "raw lnRR"),
+  Analysis = c(
+    "Four broad nutrient-defense relationships; WLS quadratic",
+    "Structural total and trait-specific relationships; WLS linear/quadratic selection"
+  ),
+  OutputDirectory = c(f2_dir, f3_dir),
+  ResultsWorkbook = c(f2_result_file, f3_result_file)
+)
+
+writexl::write_xlsx(
+  list(
+    Integration_Index = integration_index,
+    Integration_Checks = integration_checks
+  ),
+  file.path(
+    combined_out_dir,
+    "Figure2_Figure3_lnRR_INTEGRATION_INDEX.xlsx"
+  )
+)
+utils::write.csv(
+  integration_checks,
+  file.path(combined_out_dir, "integration_self_checks.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+message("============================================================")
+message("Integrated Figure 2 + Figure 3 analysis completed.")
+message("Output folder: ", combined_out_dir)
+message("Figure 2 workbook: ", f2_result_file)
+message("Figure 3 workbook: ", f3_result_file)
+message("All integration checks: PASS")
+message("============================================================")
